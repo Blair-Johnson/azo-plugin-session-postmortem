@@ -15,3 +15,6 @@ azo-postmortem = "azo_session_postmortem.cli:main"
 
 [tool.setuptools.packages.find]
 include = ["azo_session_postmortem*"]
+
+[tool.setuptools.package-data]
+azo_session_postmortem = ["skills/session-postmortem/SKILL.md", "skills/session-postmortem/references/*.md"]

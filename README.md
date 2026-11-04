@@ -2,7 +2,7 @@
 
 Native Agent Zoo tools, a Python library and a CLI for exploring session contents and building an investigator-authored map that survives context changes. The plugin does not summarize sessions, identify episodes automatically, judge success or compare agents for you. It makes the underlying material convenient to find, read, select and annotate.
 
-`trace_open` attaches sources or resumes a workspace. `trace_query` selects, joins and samples structured rows. `trace_search` searches source passages or authored map text. `trace_read` retrieves bounded slices, neighbors and call/result pairs. `trace_edit` maintains your episodes, notes, labels and relations. All three interfaces use the same backend and workspace format.
+`trace_open` attaches sources or resumes a workspace. `trace_query` selects, joins and samples structured rows. `trace_search` searches source passages or authored map text. `trace_read` retrieves bounded slices, neighbors and call/result pairs. `trace_cooccur` joins retained event selections within explicit same-session sequence windows, with separate matched, unmatched and witness results. `trace_edit` maintains your episodes, notes, labels and relations. All three interfaces use the same backend and workspace format.
 
 ## Install into Agent Zoo
 
@@ -14,6 +14,24 @@ azo-plugin install /path/to/azo-plugin-session-postmortem
 ```
 
 The manifest places the plugin in `common`, making the same tools available to interactive agents and RLMs. It introduces no runtime package dependencies. Run `/reload` in the TUI after installation, then check `list_tools` and `tool_help("trace_open")`. Installing the repository and reloading are separate operations. No backend process, session or plugin directory is modified just by importing the Python package.
+
+## Bundled investigation skill
+
+The plugin bundles the `session-postmortem` skill at
+`azo_session_postmortem/skills/session-postmortem/SKILL.md`. After installing the
+updated plugin and running `/reload`, discover it with
+`list_skills(query="session-postmortem")` and activate it with
+`skill(name="session-postmortem")`. It is available to interactive agents and RLMs
+through the host skill catalog; it is not a separate trace capability or endpoint.
+
+Use it for semantic exploration, long saved-trace investigations, comparisons,
+open-ended discovery and decision reconstruction—not as a prerequisite for ordinary
+code tasks. The skill and its `references/recipes.md` contain the agent workflow:
+question-specific selection, exact reads, evidence provenance, durable hypotheses
+and optional read inspection or bounded co-occurrence. It also covers bounded searches
+with `include_references=false` and following evidence-backed child-session navigation
+without treating output reservations as completed work. This guidance lives in the
+bundled skill, not an injected harness tutorial. `docs/api.md` remains the tool contract reference.
 
 ## Try the CLI without installing a plugin
 
@@ -51,6 +69,8 @@ This intentionally small API returns ordinary dictionaries. Use Python for parsi
 Whole-event reads and searches default to readable content rather than provider replay or bookkeeping. Explicit field anchors and `projection="all"` remain available. A user-role message can be a generated completion; inspect nullable `system_generated` rather than equating role with human authorship. `max_chars` limits read content, not every byte of JSON overhead; use reported counts and continuation cursors. Missing content, pending delivery and source text that was already truncated are different limitations.
 
 Native `trace_read(output="buffer")` returns an actual managed buffer ID usable by `view`, `grep`, `chunk_sources` and `submit_rlm`. CLI/Python calls return a packet-file path instead. Exporting a packet is not the same as reviewing it. Source search never silently substitutes your notes, and editing a map never modifies the saved session.
+
+Co-occurrence uses one to three named conditions against fixed result selectors; it does not judge relevance, success or independence. Seed reads never silently include witnesses. Its cursor pages matched rows; the returned unmatched cursor uses `trace_query`. Saved co-occurrence recipes reuse the named input results, not a fresh text search. Input coverage retains its original result scope. Hard input/seed/witness ceilings fail atomically; full saved JSON still loads in memory. See `docs/api.md` for exact limits and navigation.
 
 ## Validation and scope
 

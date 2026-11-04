@@ -8,7 +8,7 @@ import subprocess
 import sys
 import tempfile
 
-TOOLS = {"trace_open", "trace_query", "trace_search", "trace_read", "trace_edit"}
+TOOLS = {"trace_open", "trace_query", "trace_search", "trace_read", "trace_edit", "trace_cooccur"}
 
 
 def main():
@@ -46,6 +46,22 @@ def main():
             for tool in tools:
                 if "workspace" not in tool["parameters"] or "state" in tool["parameters"]:
                     raise RuntimeError(f"{name}: invalid tool schema: {tool}")
+            read_tool = next(tool for tool in tools if tool["name"] == "trace_read")
+            if "inspect" not in read_tool["parameters"]:
+                raise RuntimeError(f"{name}: read inspection is not model-visible")
+            search_tool = next(tool for tool in tools if tool["name"] == "trace_search")
+            if "include_references" not in search_tool["parameters"]:
+                raise RuntimeError(f"{name}: search reference control is not model-visible")
+            cooccur_tool = next(tool for tool in tools if tool["name"] == "trace_cooccur")
+            if set(cooccur_tool["parameters"]) != {
+                "workspace", "seed", "against", "page_size", "max_chars", "cursor", "saved", "save_as"
+            }:
+                raise RuntimeError(f"{name}: cooccur arguments are not model-visible")
+            classes = [item["short_class"] for item in pipeline["components"]]
+            if classes.count("SessionPostmortemSkill") != 1:
+                raise RuntimeError(f"{name}: missing or duplicate bundled skill registrar")
+            if classes.index("SessionPostmortemSkill") >= classes.index("SystemPromptSkillList"):
+                raise RuntimeError(f"{name}: bundled skill is registered after the skill catalog")
             result[name] = {"tools": tools, "initialized": True,
                             "warnings": pipeline.get("warnings", [])}
         print(json.dumps({"isolated_plugin_root": True, "live_install_changed": False,

@@ -59,6 +59,7 @@ class NativeTests(unittest.TestCase):
     def event_refs(self):
         return [row["ref"] for row in self.invoke("trace_query", sql="SELECT ref FROM events ORDER BY seq")["rows"]]
 
+    @unittest.skipUnless(ZOO_AVAILABLE, "feature registration requires the Agent Zoo host")
     def test_native_schema_publication_and_registration(self):
         features = []
         class Builder:
@@ -67,7 +68,8 @@ class NativeTests(unittest.TestCase):
         native.register_features(Builder(), session=None, config={})
         self.assertEqual(len(features), 1)
         self.assertEqual(features[0].name, "session_postmortem")
-        self.assertEqual(list(native.TOOLS), features[0].components)
+        self.assertIsInstance(features[0].components[0], native.SessionPostmortemSkill)
+        self.assertEqual(list(native.TOOLS), features[0].components[1:])
         self.state.pending_tool_calls = []
         for component in native.TOOLS:
             component(self.state)
@@ -79,7 +81,7 @@ class NativeTests(unittest.TestCase):
             self.assertNotIn("arguments", parameters["properties"])
             self.assertTrue(all(p.get("description") for p in parameters["properties"].values()))
             self.assertTrue({"session_cwd", "terminal_cwd"} <= component.optional_reads)
-        self.assertEqual(set(self.state.tool_schemas), {"trace_open", "trace_query", "trace_search", "trace_read", "trace_edit"})
+        self.assertEqual(set(self.state.tool_schemas), {"trace_open", "trace_query", "trace_search", "trace_read", "trace_edit", "trace_cooccur"})
         props = native.trace_query.schema["function"]["parameters"]["properties"]
         self.assertEqual(props["params"]["anyOf"][0]["type"], "object")
         self.assertEqual(set(props["sample"]["anyOf"][0]["properties"]), {"n", "by", "seed"})
@@ -162,6 +164,65 @@ class NativeTests(unittest.TestCase):
         after = {p.relative_to(self.root): p.read_bytes() for p in self.root.rglob("*") if p.is_file()}
         self.assertEqual(before, after)
         self.assertFalse(self.state.entries)
+
+    def test_inspection_is_native_and_needs_no_buffer_manager(self):
+        self.open_source()
+        refs = self.event_refs()
+        del self.state.buffer_manager
+        result = self.invoke("trace_read", targets=refs, pair=False, inspect=True, max_chars=5)
+        self.assertEqual(result["total_rows"], 2)
+        self.assertEqual(result["partially_delivered_rows"], 1)
+        self.assertEqual(result["fully_deferred_rows"], 1)
+        self.assertNotIn("blocks", result)
+        self.assertNotIn("buffer", result)
+        self.assertNotIn("Inspect naïve records", json.dumps(result, ensure_ascii=False))
+        self.assertFalse((self.root / "study" / "packets").exists())
+        selected = self.invoke("trace_read", targets=[{"result": result["plan_result"], "rows": [1]}],
+                               pair=False, line_context=0)
+        self.assertEqual(selected["blocks"][0]["text"], "The record assumption changed.")
+        self.assertFalse(hasattr(self.state, "buffer_manager"))
+
+    def test_inspection_null_defaults_and_invalid_combinations(self):
+        self.open_source()
+        ref = self.event_refs()[0]
+        normal = self.invoke("trace_read", targets=[ref], pair=False)
+        nullable = self.invoke("trace_read", targets=[ref], pair=False, inspect=None)
+        explicit = self.invoke("trace_read", targets=[ref], pair=False, inspect=False)
+        self.assertEqual(normal["blocks"], nullable["blocks"])
+        self.assertEqual(normal["blocks"], explicit["blocks"])
+        error = self.invoke("trace_read", targets=[ref], inspect=True,
+                            output="buffer", expect_error=True)
+        self.assertIn("inline", error)
+        self.assertFalse((self.root / "study" / "packets").exists())
+        first = self.invoke("trace_read", targets=[ref], max_chars=5)
+        error = self.invoke("trace_read", cursor=first["next_cursor"], inspect=True,
+                            expect_error=True)
+        self.assertIn("inspect", error)
+        rest = self.invoke("trace_read", cursor=first["next_cursor"], inspect=None)
+        self.assertIsNone(rest["next_cursor"])
+
+    def test_bundled_skill_registration_and_activation(self):
+        from agent_utils.skills import SkillRegistry
+
+        component = native.SessionPostmortemSkill()
+        self.assertIs(component(self.state), self.state)
+        registry = SkillRegistry(paths=[])
+        self.state.skill_registry = registry
+        with patch.object(registry, "add_sources", wraps=registry.add_sources) as add:
+            self.assertIs(component(self.state), self.state)
+            component(self.state)
+            self.assertEqual(add.call_count, 1)
+        skill, _ = registry.resolve("session-postmortem")
+        self.assertIsNotNone(skill)
+        self.assertEqual(skill.source_scope, "bundled")
+        self.assertIn("session-postmortem", registry.list_skills())
+        activated = registry.format_activation(skill)
+        self.assertIn("trace_read", activated)
+        self.assertIn("inspect", activated)
+        replacement = SkillRegistry(paths=[])
+        self.state.skill_registry = replacement
+        component(self.state)
+        self.assertIsNotNone(replacement.resolve("session-postmortem")[0])
 
     def test_read_continuation_preserves_engine_omission_rules(self):
         self.open_source()
@@ -277,7 +338,7 @@ class NativeTests(unittest.TestCase):
                 state.tool_schemas = {}
                 for component in builder.features[0].components:
                     component(state)
-                assert len(state.tool_schemas) == 5
+                assert len(state.tool_schemas) == 6
                 assert all(p["available"] for p in state.tool_schemas.values())
             assert sys.path == before
             assert "azo_session_postmortem" not in sys.modules
@@ -306,9 +367,10 @@ class NativeSchemaTests(unittest.TestCase):
         expected = {
             "trace_open": "workspace sessions descendants refresh page_size cursor",
             "trace_query": "workspace sql params saved sample page_size max_chars cursor save_as",
-            "trace_search": "workspace scope query mode on collapse top_k page_size max_chars saved cursor save_as projection",
-            "trace_read": "workspace targets before after pair line_context max_chars output cursor projection",
+            "trace_search": "workspace scope query mode on collapse top_k page_size max_chars saved cursor save_as projection include_references",
+            "trace_read": "workspace targets before after pair line_context max_chars output cursor projection inspect",
             "trace_edit": "workspace put delete link unlink",
+            "trace_cooccur": "workspace seed against page_size max_chars cursor saved save_as",
         }
         for name, names in expected.items():
             with self.subTest(tool=name):
@@ -363,7 +425,7 @@ class NativeSchemaTests(unittest.TestCase):
             ("trace_search", "collapse", ["none", "exact"]),
             ("trace_search", "projection", ["content", "all"]),
             ("trace_read", "projection", ["content", "all"]),
-            ("trace_read", "output", ["inline", "buffer"]),
+            ("trace_read", "output", ["inline", "compact", "buffer"]),
         ):
             self.assertEqual(self.structured(name, parameter)["enum"], values)
 
@@ -377,7 +439,7 @@ class NativeSchemaTests(unittest.TestCase):
         published = [value["schema"] for value in state.tool_schemas.values()]
         before = json.dumps(published, sort_keys=True)
         converted = _tools_for_responses(_scrub_fn_tool_schemas(published))
-        self.assertEqual(len(converted), 5)
+        self.assertEqual(len(converted), 6)
         for schema in converted:
             self.assertEqual(schema["parameters"], self.parameters(schema["name"]))
         self.assertEqual(json.dumps(published, sort_keys=True), before)
@@ -403,7 +465,7 @@ class NativeSchemaTests(unittest.TestCase):
                 validator.validate(address)
         self.assertEqual(json.dumps(target, sort_keys=True), original)
         props = self.parameters("trace_read")["properties"]
-        for name in ("targets", "before", "after", "pair", "line_context", "projection"):
+        for name in ("targets", "before", "after", "pair", "line_context", "projection", "inspect"):
             self.assertIn("null", props[name]["description"])
             self.assertIn("cursor", props[name]["description"])
 

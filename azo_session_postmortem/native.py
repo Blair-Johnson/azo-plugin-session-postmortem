@@ -123,6 +123,7 @@ def trace_search(
     cursor: str | None = None,
     save_as: str | None = None,
     projection: str | None = None,
+    include_references: bool | None = None,
     state=None,
 ) -> str:
     """Retrieve raw evidence and/or caller-authored map entries, keeping origins separate.
@@ -143,11 +144,13 @@ def trace_search(
         cursor: Continue results; only page_size and max_chars may accompany it.
         save_as: Save the search recipe under this name.
         projection: content (default) excludes transport metadata; all includes every field.
+        include_references: Follow implicit event-to-object references (default true). False keeps event-only selections within their fields; explicitly selected objects and objects in whole workspace/session scopes remain. Omit with saved or cursor.
     """
     return _dispatch("trace_search", workspace, state, scope=scope, query=query,
                      mode=mode, on=on, collapse=collapse, top_k=top_k,
                      page_size=page_size, max_chars=max_chars, saved=saved,
-                     cursor=cursor, save_as=save_as, projection=projection)
+                     cursor=cursor, save_as=save_as, projection=projection,
+                     include_references=include_references)
 
 
 @tool(optional_reads=_CWD_READS | {"buffer_manager", "step"}, writes={"buffer_manager"})
@@ -162,9 +165,10 @@ def trace_read(
     output: str | None = None,
     cursor: str | None = None,
     projection: str | None = None,
+    inspect: bool | None = None,
     state=None,
 ) -> str:
-    """Read exact anchored evidence or map cards, with bounded context and continuation.
+    """Read exact anchored evidence or map cards, or inspect their delivery costs.
 
     Buffer output returns a real managed buffer ID plus the engine's packet path.
 
@@ -176,13 +180,15 @@ def trace_read(
         pair: Include paired tool calls/results (default true); omit or use null with cursor.
         line_context: Extra lines around line anchors (default 10); omit or use null with cursor.
         max_chars: Content-text character budget, excluding headers (default 12000).
-        output: inline (default) or buffer (requires the host BufferManager).
-        cursor: Continue an immutable read snapshot using workspace, cursor and optional max_chars/output only. All other arguments must be null or omitted, even default-valued expansion flags.
+        output: inline (default), compact (same evidence, reduced metadata), or buffer (requires the host BufferManager). Choose per page; compact omits redundant delivered/default block fields, not references.
+        cursor: Continue an immutable read snapshot using workspace, cursor and optional max_chars/output. Selection/expansion arguments must be null or omitted, even default-valued flags. inspect=false is inert and also accepted.
         projection: content (default) or all; explicit field anchors remain exact. Omit or use null with cursor.
+        inspect: Predict this read's delivery costs without source bodies (default false). Initial request and inline output only; omit or use null with cursor. Page returned plan_cursor with trace_query; read selected plan_result rows normally.
     """
     return _dispatch("trace_read", workspace, state, targets=targets, before=before,
                      after=after, pair=pair, line_context=line_context,
-                     max_chars=max_chars, output=output, cursor=cursor, projection=projection)
+                     max_chars=max_chars, output=output, cursor=cursor,
+                     projection=projection, inspect=inspect)
 
 
 @tool(optional_reads=_CWD_READS)
@@ -207,6 +213,37 @@ def trace_edit(
     """
     return _dispatch("trace_edit", workspace, state, put=put, delete=delete,
                      link=link, unlink=unlink)
+
+
+@tool(optional_reads=_CWD_READS)
+def trace_cooccur(
+    workspace: str,
+    seed: dict[str, object] | None = None,
+    against: list[dict[str, object]] | None = None,
+    page_size: int | None = None,
+    max_chars: int | None = None,
+    cursor: str | None = None,
+    saved: str | None = None,
+    save_as: str | None = None,
+    state=None,
+) -> str:
+    """Join retained event selections by bounded same-session sequence windows.
+
+    No semantic judgment or source bodies. Read seed and witness results separately.
+
+    Args:
+        workspace: Workspace directory, relative to the agent session cwd.
+        seed: Retained result selector {result:ID} or {result:ID,rows:[zero-based indexes]}; omitted rows select all, [] selects none.
+        against: One to three conditions, each with unique name (not seed), selection (result selector), and nonnegative integer before/after windows. All keys required; nested nulls invalid.
+        page_size: Maximum matched seed rows per page (default 10).
+        max_chars: Visible row JSON budget (default 6000); navigation may exceed tiny budgets.
+        cursor: Continue matched rows only; only workspace, page_size and max_chars may accompany it. Page unmatched_cursor with trace_query.
+        saved: Rerun a saved cooccur recipe against its fixed input results; cannot accompany seed/against.
+        save_as: Save selectors and windows, not a fresh underlying search recipe.
+    """
+    return _dispatch("trace_cooccur", workspace, state, seed=seed, against=against,
+                     page_size=page_size, max_chars=max_chars, cursor=cursor,
+                     saved=saved, save_as=save_as)
 
 
 # The host decorator cannot infer dictionaries or mixed unions. Bare objects also
@@ -297,7 +334,25 @@ _SCOPE = {"anyOf": [
     _object({"result": _STRING}, ["result"]),
 ]}
 
+
+# Both branches require every property, including under strict provider conversion.
+# Omitted rows must not turn into a required nullable rows property.
+_RESULT_SELECTION = {"anyOf": [
+    _object({"result": {"type": "string", "minLength": 1}}, ["result"]),
+    _object({"result": {"type": "string", "minLength": 1},
+             "rows": _array({"type": "integer", "minimum": 0})}, ["result", "rows"]),
+]}
+_COOCCUR_CONDITION = _object({
+    "name": {"type": "string", "minLength": 1,
+             "description": "Unique condition name; seed is reserved."},
+    "selection": _RESULT_SELECTION,
+    "before": {"type": "integer", "minimum": 0},
+    "after": {"type": "integer", "minimum": 0},
+}, ["name", "selection", "before", "after"])
+
 for _component, _name, _schema in (
+    (trace_cooccur, "seed", _RESULT_SELECTION),
+    (trace_cooccur, "against", _array(_COOCCUR_CONDITION, minItems=1, maxItems=3)),
     (trace_query, "params", _PARAMS),
     (trace_query, "sample", _SAMPLE),
     (trace_search, "scope", _SCOPE),
@@ -312,14 +367,42 @@ for _component, _name, _values in (
     (trace_search, "collapse", ["none", "exact"]),
     (trace_search, "projection", ["content", "all"]),
     (trace_read, "projection", ["content", "all"]),
-    (trace_read, "output", ["inline", "buffer"]),
+    (trace_read, "output", ["inline", "compact", "buffer"]),
 ):
     _structured_parameter(_component, _name,
                           _nullable({"type": "string", "enum": _values}))
 
-TOOLS = (trace_open, trace_query, trace_search, trace_read, trace_edit)
+TOOLS = (trace_open, trace_query, trace_search, trace_read, trace_edit, trace_cooccur)
+
+
+class SessionPostmortemSkill:
+    """Publish the bundled skill before the harness renders its skill catalog."""
+
+    optional_reads = {"skill_registry"}
+    writes = {"skill_registry"}
+
+    def __init__(self):
+        self._registry = None
+
+    def __call__(self, state):
+        from agent_utils.skills import SkillSource
+
+        registry = getattr(state, "skill_registry", None)
+        if registry is not None and registry is not self._registry:
+            registry.add_sources(SkillSource(
+                Path(__file__).resolve().parent / "skills/session-postmortem/SKILL.md",
+                kind="azo-plugin-session-postmortem", scope="bundled",
+                precedence=-5000, native=True, always_list=True,
+            ))
+            self._registry = registry
+        return state
 
 
 def register_features(builder, *, session, config):
-    """Register the same five tools in both common-scope pipelines."""
-    builder.add(Feature(name="session_postmortem", components=list(TOOLS)))
+    """Register six tools and their bundled skill in both common-scope pipelines."""
+    from agents.system_prompt import SystemPromptSkillList
+
+    builder.add(Feature(
+        name="session_postmortem", components=[SessionPostmortemSkill(), *TOOLS],
+        order=[SessionPostmortemSkill, SystemPromptSkillList],
+    ))

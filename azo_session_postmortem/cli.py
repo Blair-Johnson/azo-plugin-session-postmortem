@@ -1,4 +1,4 @@
-"""CLI transport for the five session-investigation tools."""
+"""CLI transport for the six session-investigation tools."""
 from __future__ import annotations
 
 import argparse
@@ -7,7 +7,7 @@ import sys
 import time
 from pathlib import Path
 
-TOOLS = ("trace_open", "trace_query", "trace_search", "trace_read", "trace_edit")
+TOOLS = ("trace_open", "trace_query", "trace_search", "trace_read", "trace_edit", "trace_cooccur")
 
 
 def main(argv=None):

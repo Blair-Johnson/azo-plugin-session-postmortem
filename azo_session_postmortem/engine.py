@@ -10,8 +10,13 @@ import random
 import re
 import sqlite3
 
+if __package__:
+    from .navigation import ensure_session_links, navigation_rows
+else:
+    from navigation import ensure_session_links, navigation_rows
 
-PUBLIC = {'sessions', 'events', 'objects', 'links', 'map_entries',
+
+PUBLIC = {'sessions', 'events', 'objects', 'links', 'session_links', 'map_entries',
           'map_members', 'map_links', 'result_items', 'saved_queries'}
 SCHEMA = '''
 CREATE TABLE IF NOT EXISTS sessions(id TEXT PRIMARY KEY,parent_id TEXT,title TEXT,source TEXT,warnings TEXT);
@@ -238,7 +243,12 @@ def _anchor(db, value):
     field = value.get('field', 'text')
     text = _field_text(db, ref, field)
     if key == 'event' and text is None:
-        raise ValueError('unknown event field: ' + str(field))
+        fields = [r['field'] for r in _rows(db,
+            'SELECT field FROM _content WHERE ref=? ORDER BY field', (ref,))]
+        example = {'event': ref, 'field': fields[0]} if fields else ref
+        raise ValueError(
+            f'unknown event field: ref={ref!r}, requested field={field!r}; '
+            f'available fields={_json(fields)}; valid target example: {_json(example)}')
     if 'lines' in value:
         lo, hi = _range(value['lines'])
         line_count = max(1, len(text.splitlines())) if text is not None else None
@@ -262,13 +272,13 @@ def _range(value):
     return lo, hi
 
 
-def _resolve(db, targets, source_only=False):
+def _resolve(db, targets, source_only=False, *, search_projection=None):
     out = []
     for target in _list(targets, 'targets'):
         if isinstance(target, dict) and 'result' in target:
             if set(target) - {'result', 'rows'}:
                 raise ValueError('invalid result target')
-            _, rows, _ = _get_result(db, target['result'])
+            _, rows, meta = _get_result(db, target['result'])
             indexes = target.get('rows', list(range(len(rows))))
             _list(indexes, 'rows')
             found = []
@@ -280,7 +290,21 @@ def _resolve(db, targets, source_only=False):
                 if not selected:
                     raise ValueError('result contains non-navigable rows')
                 found.extend(selected)
-            out.extend(_resolve(db, found, source_only))
+            resolved = _resolve(db, found, source_only, search_projection=search_projection)
+            if search_projection is not None and meta.get('_search_no_implicit_objects'):
+                # Cooccur stores original anchors for read/map/requery consumers.
+                # Only search resolves whole events to existing explicit fields,
+                # preventing _source_windows from following object references.
+                for anchor in resolved:
+                    if isinstance(anchor, str) and db.execute(
+                            'SELECT 1 FROM events WHERE ref=?', (anchor,)).fetchone():
+                        out.extend({'event': anchor, 'field': row['field']} for row in _rows(db,
+                            'SELECT field FROM _content WHERE ref=? ORDER BY field', (anchor,))
+                            if search_projection == 'all' or row['field'] in CONTENT_FIELDS)
+                    else:
+                        out.append(anchor)
+            else:
+                out.extend(resolved)
         elif isinstance(target, dict) and 'entry' in target:
             if set(target) - {'entry', 'part'}:
                 raise ValueError('invalid entry target')
@@ -380,6 +404,7 @@ def trace_open(db, workspace, sessions=None, descendants=True, refresh=False,
                     for edge in session.get('links', []):
                         db.execute('INSERT OR IGNORE INTO links VALUES(?,?,?)', (edge['src'], edge['dst'], edge['kind']))
                 db.execute('INSERT OR REPLACE INTO _sources VALUES(?,?)', (locator, int(descend)))
+            ensure_session_links(db, rebuild=True)
         sources = _rows(db, 'SELECT * FROM sessions ORDER BY id')
         for source in sources:
             source['warnings'] = json.loads(source['warnings'])
@@ -389,7 +414,7 @@ def trace_open(db, workspace, sessions=None, descendants=True, refresh=False,
                  'recent_entries': [_preview(c) for c in cards],
                  'saved_queries': _rows(db, 'SELECT * FROM saved_queries ORDER BY name'),
                  'counts': {table: db.execute('SELECT count(*) FROM ' + table).fetchone()[0]
-                            for table in ('sessions', 'events', 'objects', 'links', 'map_entries', 'map_links', 'saved_queries')}}
+                            for table in ('sessions', 'events', 'objects', 'links', 'session_links', 'map_entries', 'map_links', 'saved_queries')}}
         for recipe in state['saved_queries']:
             recipe['arguments'] = json.loads(recipe['arguments'])
     offset = state['offset']
@@ -400,7 +425,8 @@ def trace_open(db, workspace, sessions=None, descendants=True, refresh=False,
         'embeddings': 'unsupported; no model calls',
         'content_types': ['events', 'objects', 'map_entries'],
         'projections': ['content', 'all'], 'default_projection': 'content',
-        'read_budget_unit': 'text_chars',
+        'read_budget_unit': 'text_chars', 'read_inspection': True,
+        'session_navigation': True, 'search_include_references': True,
         'map_kinds': {'episode': 'requires anchors', 'note': 'anchors optional; use pinned for continuation'},
         'query_schema': 'docs/api.md',
         'sql_tables': sorted(PUBLIC), 'buffer_output': 'workspace packet file'})
@@ -547,7 +573,7 @@ def trace_query(db, workspace, sql=None, params=None, saved=None, sample=None,
 
 
 # Source scopes and lexical retrieval.
-def _scope(db, scope, on):
+def _scope(db, scope, on, *, search_projection=None):
     scope = {'workspace': True} if scope is None else scope
     if not isinstance(scope, dict) or len(scope) != 1:
         raise ValueError('scope must specify exactly one selector')
@@ -567,9 +593,10 @@ def _scope(db, scope, on):
         anchors = [a for entry in value for a in _card(db, entry)['anchors']]
         return _expand(db, anchors), set(value)
     elif key == 'refs':
-        anchors = _resolve(db, value, True)
+        anchors = _resolve(db, value, True, search_projection=search_projection)
     elif key == 'result':
-        anchors = _resolve(db, [{'result': value}], on != 'map')
+        anchors = _resolve(db, [{'result': value}], on != 'map',
+                           search_projection=search_projection)
         cards = [a['entry'] for a in anchors if isinstance(a, dict) and 'entry' in a]
         anchors = [a for a in anchors if not (isinstance(a, dict) and 'entry' in a)]
         if cards:
@@ -700,6 +727,54 @@ def _matches(text, mode, pattern, terms, offset=0):
             yield lo + offset, hi + offset, excerpt, None
 
 
+def _scope_summary(db, windows, unavailable, include_references, projection):
+    """Bounded source selection accounting, not a hit summary or contiguous range.
+
+    Counts use effective windows plus known unavailable references. Fields count
+    distinct searchable (ref, field) pairs; unavailable objects count as objects
+    but contribute no searchable fields. Map-only searches have no source counts.
+    """
+    summary = {'include_references': include_references, 'projection': projection,
+               'event_count': None, 'object_count': None, 'field_count': None,
+               'unavailable_object_count': None, 'session_count': None,
+               'sessions': [], 'sessions_truncated': False,
+               'sequence_coverage': 'envelopes_not_contiguous'}
+    if windows is None:
+        return summary
+    field_counts = {}
+    for ref, field in windows:
+        field_counts[ref] = field_counts.get(ref, 0) + 1
+    sessions = {}
+    events = objects = missing = 0
+    for ref in sorted(set(field_counts) | set(unavailable)):
+        event = _row(db, 'SELECT session,seq FROM events WHERE ref=?', (ref,))
+        source = event or _row(db, 'SELECT session FROM objects WHERE ref=?', (ref,))
+        if source is None:
+            continue
+        session = sessions.setdefault(source['session'], {
+            'session': source['session'], 'event_count': 0, 'object_count': 0,
+            'field_count': 0, 'unavailable_object_count': 0,
+            'seq_min': None, 'seq_max': None})
+        session['field_count'] += field_counts.get(ref, 0)
+        if event:
+            events += 1
+            session['event_count'] += 1
+            seq = event['seq']
+            session['seq_min'] = seq if session['seq_min'] is None else min(session['seq_min'], seq)
+            session['seq_max'] = seq if session['seq_max'] is None else max(session['seq_max'], seq)
+        else:
+            objects += 1
+            session['object_count'] += 1
+            if ref in unavailable:
+                missing += 1
+                session['unavailable_object_count'] += 1
+    summary.update(event_count=events, object_count=objects, field_count=len(windows),
+                   unavailable_object_count=missing, session_count=len(sessions),
+                   sessions=[sessions[sid] for sid in sorted(sessions, key=str)[:READ_PREVIEW_LIMIT]],
+                   sessions_truncated=len(sessions) > READ_PREVIEW_LIMIT)
+    return summary
+
+
 def _search_page(db, result, offset, page_size, max_chars):
     kind, rows, meta = _get_result(db, result)
     if kind not in ('search', 'occurrences'):
@@ -712,13 +787,17 @@ def _search_page(db, result, offset, page_size, max_chars):
         # Old selections did not capture coverage; absence is unknown, not zero.
         'unavailable': meta.get('unavailable', []),
         'unavailable_count': meta.get('unavailable_count'),
+        'scope_summary': meta.get('scope_summary'),
         'next_cursor': _cursor(db, 'search', {'result': result, 'offset': end}) if end < len(rows) else None}
 
 
 def trace_search(db, workspace, scope=None, query=None, mode='terms', on='source',
                  collapse='none', top_k=100, page_size=12, max_chars=6000,
-                 saved=None, cursor=None, save_as=None, projection='content'):
+                 saved=None, cursor=None, save_as=None, projection='content',
+                 include_references=True):
     _projection(projection)
+    if not isinstance(include_references, bool):
+        raise ValueError('include_references must be a boolean')
     if cursor:
         state = _uncursor(db, cursor, 'search')
         return _search_page(db, state['result'], state['offset'], page_size, max_chars)
@@ -727,6 +806,9 @@ def trace_search(db, workspace, scope=None, query=None, mode='terms', on='source
         scope, query, mode, on, collapse, top_k = (recipe[k] for k in ('scope', 'query', 'mode', 'on', 'collapse', 'top_k'))
         # Pre-v1 recipes searched all fields; do not silently change their meaning.
         projection = _projection(recipe.get('projection', 'all'))
+        include_references = recipe.get('include_references', True)
+        if not isinstance(include_references, bool):
+            raise ValueError('include_references must be a boolean')
     if mode == 'similar':
         raise ValueError('unsupported mode: similar (no embedding index configured)')
     if on not in ('source', 'map', 'both'):
@@ -735,19 +817,23 @@ def trace_search(db, workspace, scope=None, query=None, mode='terms', on='source
         raise ValueError('collapse must be none or exact')
     _positive(top_k, 'top_k')
     pattern, terms = _matcher(query, mode)
-    anchors, map_ids = _scope(db, scope, on)
+    anchors, map_ids = _scope(db, scope, on,
+                             search_projection=projection if on != 'map' else None)
     hits = {'source': [], 'map': []}
-    coverage = {}
+    coverage = {'scope_summary': _scope_summary(db, None, {}, include_references, projection)}
     if on in ('source', 'both'):
         unavailable = {}
-        windows = _source_windows(db, anchors, projection=projection, unavailable=unavailable)
+        windows = _source_windows(db, anchors, references=include_references,
+                                  projection=projection, unavailable=unavailable)
         if isinstance(scope, dict) and 'sessions' in scope:
             allowed_refs = {r['ref'] for sid in scope['sessions'] for r in _rows(db,
                 'SELECT ref FROM events WHERE session=? UNION SELECT ref FROM objects WHERE session=?', (sid, sid))}
             windows = {key: value for key, value in windows.items() if key[0] in allowed_refs}
             unavailable = {ref: notice for ref, notice in unavailable.items() if ref in allowed_refs}
         coverage = {'unavailable': list(unavailable.values())[:READ_PREVIEW_LIMIT],
-                    'unavailable_count': len(unavailable)}
+                    'unavailable_count': len(unavailable),
+                    'scope_summary': _scope_summary(db, windows, unavailable,
+                                                    include_references, projection)}
         for (ref, field), ranges in windows.items():
             text = _field_text(db, ref, field)
             lines = text.splitlines() or ['']
@@ -763,6 +849,9 @@ def trace_search(db, workspace, scope=None, query=None, mode='terms', on='source
                         hit['score'] = score
                     hits['source'].append(hit)
     if on in ('map', 'both'):
+        if on == 'both':
+            # The search-only source restriction must not narrow map intersections.
+            anchors, map_ids = _scope(db, scope, on)
         for record in _rows(db, 'SELECT id FROM map_entries ORDER BY id'):
             card = _card(db, record['id'])
             if map_ids is not None:
@@ -805,7 +894,7 @@ def trace_search(db, workspace, scope=None, query=None, mode='terms', on='source
         hit['row'] = i
     result = _store_result(db, 'search', rows, {'matched_total': counts, 'selected_count': dict(counts), **coverage})
     recipe = {'scope': scope, 'query': query, 'mode': mode, 'on': on, 'collapse': collapse,
-              'top_k': top_k, 'projection': projection}
+              'top_k': top_k, 'projection': projection, 'include_references': include_references}
     _save_query(db, save_as, 'search', recipe, result)
     if saved:
         db.execute('UPDATE saved_queries SET last_result=? WHERE name=?', (result, saved))
@@ -894,28 +983,121 @@ def _read_plan(db, targets, before, after, pair, line_context, projection='conte
     return plan
 
 
+def _read_size(block):
+    """Charge cards as compact JSON and source bodies as Unicode characters."""
+    if 'card' in block:
+        return len(_json(block['card']))
+    return len(block['text']) if 'text' in block else None
+
+
+def _read_take(size, card, budget, block_count):
+    """Return the next block's text allowance, or None when this page must stop."""
+    if budget <= 0 or block_count >= READ_BLOCK_LIMIT:
+        return None
+    # A card only splits when it is the first block, even if some budget remains.
+    if card and size > budget and block_count:
+        return None
+    return min(size, budget) if size is not None else 0
+
+
+def _inspect_read(db, plan, max_chars):
+    """Persist only cost metadata and exact anchors, never read bodies or cursors."""
+    _positive(max_chars, 'max_chars')
+    rows = []
+    budget, block_count, stopped = max_chars, 0, False
+    for index, block in enumerate(plan):
+        size = _read_size(block)
+        take = None if stopped else _read_take(size, 'card' in block, budget, block_count)
+        if take is None:
+            stopped = True
+        else:
+            budget -= take
+            block_count += 1
+        card = block.get('card')
+        anchor = {'entry': block['entry_id'], 'part': 'card'} if card is not None else block['anchor']
+        metadata = block
+        if size is None:
+            metadata = (_row(db, 'SELECT kind,role,tool FROM events WHERE ref=?', (block['ref'],))
+                        or _row(db, 'SELECT kind FROM objects WHERE ref=?', (block['ref'],)) or {})
+        rows.append({'row': index, 'anchor': anchor, 'requested': block['requested'],
+                     'kind': 'map_card' if card is not None else metadata.get('kind'),
+                     'role': metadata.get('role'), 'tool': metadata.get('tool'),
+                     'text_chars': size, 'would_deliver_chars': (take or 0) if size is not None else None,
+                     'available': size is not None, '_anchors': [anchor]})
+    columns = ['row', 'anchor', 'requested', 'kind', 'role', 'tool',
+               'text_chars', 'would_deliver_chars', 'available']
+    result = _store_result(db, 'query', rows, {'columns': columns, 'sampling': None})
+    page, _ = _display_page(rows, 0, 16, 4000)
+    # Unlike ordinary query display, inspection's fixed cap cannot overflow for
+    # a giant navigation anchor. Keep such a row available through plan_cursor.
+    while len(_json(page)) > 4000:
+        page.pop()
+    return {'plan_result': result, 'rows': page,
+            'plan_cursor': _cursor(db, 'query', {'result': result, 'offset': len(page)}) if len(page) < len(rows) else None,
+            'total_rows': len(rows), 'known_text_chars': sum(r['text_chars'] or 0 for r in rows),
+            'unavailable_rows': sum(not r['available'] for r in rows),
+            'partially_delivered_rows': sum(0 < r['would_deliver_chars'] < r['text_chars']
+                                            for r in rows if r['available']),
+            'fully_deferred_rows': sum(r['text_chars'] > 0 and r['would_deliver_chars'] == 0
+                                      for r in rows if r['available']),
+            'max_chars': max_chars, 'budget_unit': 'text_chars',
+            'predicted_text_chars': max_chars - budget}
+
+
+def _compact_read(result):
+    """Render a selected page without changing its bodies, coverage or navigation."""
+    result = dict(result)
+    blocks, delivered = [], []
+    for original in result['blocks']:
+        block = dict(original)
+        if block.get('requested') is True:
+            block.pop('requested')
+        if 'text' in block:
+            if block.get('char_end') == block.get('char_offset', 0) + len(block['text']):
+                block.pop('char_end')
+            if block.get('char_offset') == 0:
+                block.pop('char_offset')
+            if block.get('complete') is True:
+                block.pop('complete')
+        blocks.append(block)
+        delivery = ({'anchor': block['anchor']} if 'anchor' in block else
+                    {'entry': block.get('entry_id'), 'part': 'card'})
+        if 'text' in block:
+            offset = block.get('char_offset', 0)
+            delivery.update(char_offset=offset, char_end=block.get('char_end', offset + len(block['text'])))
+        elif 'card' not in block:
+            delivery = {'anchor': block.get('anchor'), 'available': False}
+        delivered.append(delivery)
+    # Old cursor blocks may lack anchors. Keep any non-reconstructible navigation.
+    if delivered == result['delivered']:
+        result.pop('delivered')
+    result.update(blocks=blocks, packet_format='compact_read_json_v1', packet_chars=0)
+    # Include the count's own digits, just as in the legacy inline layout.
+    while result['packet_chars'] != len(_json(result)):
+        result['packet_chars'] = len(_json(result))
+    return result
+
+
 def _read_page(db, workspace, plan, max_chars, output):
     """max_chars bounds content text, not headers, metadata or JSON escaping.
 
     packet_chars is Unicode characters in the UTF-8 packet file (buffer), or
-    in this response's canonical compact JSON (inline), not CLI pretty JSON.
+    in this response's canonical compact JSON (inline/compact), not CLI pretty JSON.
     """
     _positive(max_chars, 'max_chars')
-    if output not in ('inline', 'buffer'):
-        raise ValueError('output must be inline or buffer')
+    if output not in ('inline', 'compact', 'buffer'):
+        raise ValueError('output must be inline, compact or buffer')
     blocks, delivered = [], []
     budget = max_chars
     rest = []
     for index, original in enumerate(plan):
-        if budget <= 0 or len(blocks) >= READ_BLOCK_LIMIT:
+        size = _read_size(original)
+        take = _read_take(size, 'card' in original, budget, len(blocks))
+        if take is None:
             rest.extend(plan[index:])
             break
         block = dict(original)
         if 'card' in block:
-            size = len(_json(block['card']))
-            if size > budget and blocks:
-                rest.extend(plan[index:])
-                break
             if size > budget:
                 # Split oversized cards as compact JSON, preserving character offsets.
                 block['text'] = _json(block.pop('card'))
@@ -931,7 +1113,6 @@ def _read_page(db, workspace, plan, max_chars, output):
             delivered.append({'anchor': block.get('anchor', block.get('ref')), 'available': False})
             continue
         text = block['text']
-        take = min(len(text), budget)
         shown = text[:take]
         block['text'] = shown
         start = block.get('line_start', 1)
@@ -999,6 +1180,15 @@ def _read_page(db, workspace, plan, max_chars, output):
             {'columns': ['src', 'dst', 'kind'], 'sampling': None})
         result['references_cursor'] = _cursor(db, 'query',
             {'result': result['references_result'], 'offset': READ_PREVIEW_LIMIT})
+    navigation = navigation_rows(db, list(sources))
+    result.update(session_navigation=navigation[:READ_PREVIEW_LIMIT],
+                  session_navigation_count=len(navigation))
+    if len(navigation) > READ_PREVIEW_LIMIT:
+        rows = [dict(row, _anchors=[row['anchor']]) for row in navigation]
+        result['session_navigation_result'] = _store_result(db, 'query', rows,
+            {'columns': sorted({key for row in navigation for key in row}), 'sampling': None})
+        result['session_navigation_cursor'] = _cursor(db, 'query',
+            {'result': result['session_navigation_result'], 'offset': READ_PREVIEW_LIMIT})
     if output == 'buffer':
         packet = Path(workspace) / 'packets'
         packet.mkdir(exist_ok=True)
@@ -1014,6 +1204,8 @@ def _read_page(db, workspace, plan, max_chars, output):
         result.pop('blocks')
         result.update(buffer=str(path), buffer_path=str(path),
                       packet_format='text', packet_chars=len(packet_text))
+    elif output == 'compact':
+        return _compact_read(result)
     else:
         result.update(packet_format='compact_json', packet_chars=0)
         # Include the count's own digits in the compact response length.
@@ -1024,7 +1216,13 @@ def _read_page(db, workspace, plan, max_chars, output):
 
 def trace_read(db, workspace, targets=None, before=0, after=0, pair=True,
                line_context=10, max_chars=12000, output='inline', cursor=None,
-               projection='content'):
+               projection='content', inspect=False):
+    if not isinstance(inspect, bool):
+        raise ValueError('inspect must be a boolean')
+    if inspect and cursor is not None:
+        raise ValueError('inspect=true cannot accompany cursor; inspection is initial-request-only')
+    if inspect and output != 'inline':
+        raise ValueError('inspect=true requires output="inline"')
     _projection(projection)
     for name, value in (('before', before), ('after', after), ('line_context', line_context)):
         _positive(value, name, zero=True)
@@ -1036,6 +1234,8 @@ def trace_read(db, workspace, targets=None, before=0, after=0, pair=True,
         if targets is None:
             raise ValueError('targets are required')
         plan = _read_plan(db, targets, before, after, pair, line_context, projection)
+    if inspect:
+        return _inspect_read(db, plan, max_chars)
     return _read_page(db, workspace, plan, max_chars, output)
 
 
@@ -1143,17 +1343,29 @@ def trace_edit(db, workspace, put=None, delete=None, link=None, unlink=None):
             'unlinked': unlinked, 'entry_previews': previews}
 
 
+def trace_cooccur(db, workspace, seed=None, against=None, page_size=10,
+                  max_chars=6000, cursor=None, saved=None, save_as=None):
+    """Join retained selections without loading the backend for other tools."""
+    if __package__:
+        from .cooccur import trace_cooccur as cooccur
+    else:
+        from cooccur import trace_cooccur as cooccur
+    return cooccur(db, workspace, seed=seed, against=against, page_size=page_size,
+                   max_chars=max_chars, cursor=cursor, saved=saved, save_as=save_as)
+
+
 _OPERATIONS = {
     'trace_open': (trace_open, {'sessions', 'descendants', 'refresh', 'page_size', 'cursor'}),
     'trace_query': (trace_query, {'sql', 'params', 'saved', 'sample', 'page_size', 'max_chars', 'cursor', 'save_as'}),
-    'trace_search': (trace_search, {'scope', 'query', 'mode', 'on', 'collapse', 'top_k', 'page_size', 'max_chars', 'saved', 'cursor', 'save_as', 'projection'}),
-    'trace_read': (trace_read, {'targets', 'before', 'after', 'pair', 'line_context', 'max_chars', 'output', 'cursor', 'projection'}),
+    'trace_search': (trace_search, {'scope', 'query', 'mode', 'on', 'collapse', 'top_k', 'page_size', 'max_chars', 'saved', 'cursor', 'save_as', 'projection', 'include_references'}),
+    'trace_read': (trace_read, {'targets', 'before', 'after', 'pair', 'line_context', 'max_chars', 'output', 'cursor', 'projection', 'inspect'}),
     'trace_edit': (trace_edit, {'put', 'delete', 'link', 'unlink'}),
+    'trace_cooccur': (trace_cooccur, {'seed', 'against', 'page_size', 'max_chars', 'cursor', 'saved', 'save_as'}),
 }
 
 
 def dispatch(tool, arguments):
-    """Execute one of the five trace contracts in a single SQLite transaction."""
+    """Execute one of the six trace contracts in a single SQLite transaction."""
     if tool not in _OPERATIONS:
         raise ValueError('unknown trace tool: ' + str(tool))
     if not isinstance(arguments, dict):
@@ -1172,6 +1384,10 @@ def dispatch(tool, arguments):
         if tool == 'trace_read':
             paging = {'cursor', 'max_chars', 'output'}
         prohibited = set(args) - paging
+        if tool == 'trace_read':
+            # False is inert; trace_read validates the type and rejects True.
+            # Keep the existing cursor-selection diagnostic unchanged.
+            prohibited.discard('inspect')
         if prohibited:
             raise ValueError(
                 'cursor cannot accompany supplied selection or expansion arguments: '
@@ -1181,8 +1397,10 @@ def dispatch(tool, arguments):
                 + '. Omit other arguments (native tools also accept null).')
     if tool == 'trace_query' and args.get('saved') is not None and any(k in args for k in ('sql', 'params', 'sample')):
         raise ValueError('saved cannot accompany a new query')
-    if tool == 'trace_search' and args.get('saved') is not None and any(k in args for k in ('scope', 'query', 'mode', 'on', 'collapse', 'top_k', 'projection')):
+    if tool == 'trace_search' and args.get('saved') is not None and any(k in args for k in ('scope', 'query', 'mode', 'on', 'collapse', 'top_k', 'projection', 'include_references')):
         raise ValueError('saved cannot accompany a new search')
+    if tool == 'trace_cooccur' and args.get('saved') is not None and any(k in args for k in ('seed', 'against')):
+        raise ValueError('saved cannot accompany seed or against')
     db = None
     try:
         path = workspace / 'trace.sqlite3'
@@ -1199,6 +1417,7 @@ def dispatch(tool, arguments):
             # Keep ALTER and backfill atomic even if the requested operation fails.
             db.execute('BEGIN')
             _ensure_system_generated(db)
+            ensure_session_links(db)
             return operation(db, workspace, **args)
     except (sqlite3.Error, OSError, TypeError, KeyError) as exc:
         raise ValueError(str(exc)) from exc
