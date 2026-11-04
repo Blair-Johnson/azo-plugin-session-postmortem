@@ -241,8 +241,13 @@ def _anchor(db, value):
         raise ValueError('unknown event field: ' + str(field))
     if 'lines' in value:
         lo, hi = _range(value['lines'])
-        if text is not None and hi > max(1, len(text.splitlines())):
-            raise ValueError('line range exceeds source field')
+        line_count = max(1, len(text.splitlines())) if text is not None else None
+        if line_count is not None and hi > line_count:
+            whole = {key: ref, **({'field': field} if key == 'event' else {})}
+            raise ValueError(
+                f'line range exceeds source field: ref={ref!r}, field={field!r}, '
+                f'requested=[{lo}, {hi}], available line count={line_count}; '
+                f'omit lines to read the whole field: {_json(whole)}')
     return value
 
 
@@ -584,7 +589,7 @@ def _merge_ranges(ranges):
     return merged
 
 
-def _source_windows(db, anchors, references=True, projection='all'):
+def _source_windows(db, anchors, references=True, projection='all', unavailable=None):
     """Unique (ref,field) windows. Explicit event fields bypass projection."""
     _projection(projection)
     if anchors is None:
@@ -596,13 +601,17 @@ def _source_windows(db, anchors, references=True, projection='all'):
             if isinstance(anchor, str) and db.execute('SELECT 1 FROM events WHERE ref=?', (anchor,)).fetchone():
                 extra.extend(r['dst'] for r in _rows(db,
                     'SELECT l.dst FROM links l JOIN objects o ON o.ref=l.dst '
-                    'WHERE l.src=? AND l.kind="references" AND o.available=1', (anchor,)))
+                    'WHERE l.src=? AND l.kind="references"', (anchor,)))
         anchors += extra
     windows = {}
     for anchor in anchors:
         ref = _ref(anchor)
         explicit_field = isinstance(anchor, dict) and 'event' in anchor
         rows = _rows(db, 'SELECT field,text FROM _content WHERE ref=? ORDER BY field', (ref,))
+        if not rows and unavailable is not None:
+            obj = _row(db, 'SELECT reason FROM objects WHERE ref=?', (ref,))
+            unavailable.setdefault(ref, {'anchor': anchor,
+                'reason': (obj or {}).get('reason') or 'Referenced content is unavailable'})
         for row in rows:
             if explicit_field:
                 if row['field'] != anchor.get('field', 'text'):
@@ -700,6 +709,9 @@ def _search_page(db, result, offset, page_size, max_chars):
         'source': [r for r in page if r['origin'] == 'source'],
         'map': [r for r in page if r['origin'] == 'map']},
         'matched_total': meta['matched_total'], 'selected_count': meta['selected_count'],
+        # Old selections did not capture coverage; absence is unknown, not zero.
+        'unavailable': meta.get('unavailable', []),
+        'unavailable_count': meta.get('unavailable_count'),
         'next_cursor': _cursor(db, 'search', {'result': result, 'offset': end}) if end < len(rows) else None}
 
 
@@ -725,12 +737,17 @@ def trace_search(db, workspace, scope=None, query=None, mode='terms', on='source
     pattern, terms = _matcher(query, mode)
     anchors, map_ids = _scope(db, scope, on)
     hits = {'source': [], 'map': []}
+    coverage = {}
     if on in ('source', 'both'):
-        windows = _source_windows(db, anchors, projection=projection)
+        unavailable = {}
+        windows = _source_windows(db, anchors, projection=projection, unavailable=unavailable)
         if isinstance(scope, dict) and 'sessions' in scope:
             allowed_refs = {r['ref'] for sid in scope['sessions'] for r in _rows(db,
                 'SELECT ref FROM events WHERE session=? UNION SELECT ref FROM objects WHERE session=?', (sid, sid))}
             windows = {key: value for key, value in windows.items() if key[0] in allowed_refs}
+            unavailable = {ref: notice for ref, notice in unavailable.items() if ref in allowed_refs}
+        coverage = {'unavailable': list(unavailable.values())[:READ_PREVIEW_LIMIT],
+                    'unavailable_count': len(unavailable)}
         for (ref, field), ranges in windows.items():
             text = _field_text(db, ref, field)
             lines = text.splitlines() or ['']
@@ -779,14 +796,14 @@ def trace_search(db, workspace, scope=None, query=None, mode='terms', on='source
                 occurrence['row'] = i
             hit['occurrences_result'] = _store_result(db, 'occurrences', group, {
                 'matched_total': {'source': len(group), 'map': 0},
-                'selected_count': {'source': len(group), 'map': 0}})
+                'selected_count': {'source': len(group), 'map': 0}, **coverage})
             hit['_anchors'] = [h['anchor'] for h in group]
             collapsed.append(hit)
         hits['source'] = collapsed
     rows = hits['source'] + hits['map']
     for i, hit in enumerate(rows):
         hit['row'] = i
-    result = _store_result(db, 'search', rows, {'matched_total': counts, 'selected_count': dict(counts)})
+    result = _store_result(db, 'search', rows, {'matched_total': counts, 'selected_count': dict(counts), **coverage})
     recipe = {'scope': scope, 'query': query, 'mode': mode, 'on': on, 'collapse': collapse,
               'top_k': top_k, 'projection': projection}
     _save_query(db, save_as, 'search', recipe, result)
@@ -1154,8 +1171,14 @@ def dispatch(tool, arguments):
         paging = {'cursor', 'page_size', 'max_chars'}
         if tool == 'trace_read':
             paging = {'cursor', 'max_chars', 'output'}
-        if set(args) - paging:
-            raise ValueError('cursor cannot accompany selection or expansion arguments')
+        prohibited = set(args) - paging
+        if prohibited:
+            raise ValueError(
+                'cursor cannot accompany supplied selection or expansion arguments: '
+                + ', '.join(sorted(prohibited))
+                + '; allowed arguments with cursor: '
+                + ', '.join(sorted({'workspace'} | (paging & allowed)))
+                + '. Omit other arguments (native tools also accept null).')
     if tool == 'trace_query' and args.get('saved') is not None and any(k in args for k in ('sql', 'params', 'sample')):
         raise ValueError('saved cannot accompany a new query')
     if tool == 'trace_search' and args.get('saved') is not None and any(k in args for k in ('scope', 'query', 'mode', 'on', 'collapse', 'top_k', 'projection')):

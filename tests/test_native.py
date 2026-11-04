@@ -86,7 +86,7 @@ class NativeTests(unittest.TestCase):
         props = native.trace_read.schema["function"]["parameters"]["properties"]
         targets = props["targets"]["anyOf"][0]["items"]["anyOf"]
         self.assertEqual(targets[0], {"type": "string"})
-        self.assertEqual(len(targets), 6)
+        self.assertEqual(len(targets), 8)
         self.assertTrue(all(v.get("properties") for v in targets[1:]))
         self.assertEqual(props["pair"]["type"], ["boolean", "null"])
         self.assertEqual(props["max_chars"]["type"], ["integer", "null"])
@@ -171,6 +171,29 @@ class NativeTests(unittest.TestCase):
         second = self.invoke("trace_read", cursor=first["next_cursor"], max_chars=10, output="buffer")
         self.assertIn(second["buffer"], self.state.buffer_manager)
         self.assertNotEqual(first["buffer"], second["buffer"])
+
+    def test_read_recovery_errors_and_null_continuation(self):
+        self.open_source()
+        ref = self.event_refs()[0]
+        whole = {"event": ref, "field": "text"}
+        error = self.invoke("trace_read", targets=[{**whole, "lines": [1, 3]}], expect_error=True)
+        for detail in (ref, "field='text'", "requested=[1, 3]", "available line count=2",
+                       "omit lines to read the whole field"):
+            self.assertIn(detail, error)
+        first = self.invoke("trace_read", targets=[whole], pair=False, max_chars=5)
+        cursor = first["next_cursor"]
+        database = self.root / "study" / "trace.sqlite3"
+        snapshot = database.read_bytes()
+        error = self.invoke("trace_read", cursor=cursor, before=0, after=0, pair=True,
+                            line_context=10, projection="content", expect_error=True)
+        self.assertIn("arguments: after, before, line_context, pair, projection", error)
+        self.assertIn("allowed arguments with cursor: cursor, max_chars, output, workspace", error)
+        self.assertEqual(database.read_bytes(), snapshot)
+        second = self.invoke("trace_read", cursor=cursor, targets=None, before=None, after=None,
+                             pair=None, line_context=None, projection=None, max_chars=1000)
+        text = "".join(b["text"] for page in (first, second) for b in page["blocks"])
+        self.assertEqual(text, "Inspect naïve records.\r\nKeep evidence exact.\n")
+        self.assertIsNone(second["next_cursor"])
 
     def test_saved_search_and_query_cursor_use_engine_defaults(self):
         self.open_source()
@@ -314,7 +337,7 @@ class NativeSchemaTests(unittest.TestCase):
 
     def test_nested_addresses_scopes_and_enums(self):
         expected = [{"event", "field", "lines"}, {"object", "lines"}, {"session", "events"},
-                    {"result", "rows"}, {"entry", "part"}]
+                    {"result", "rows"}, {"event", "field"}, {"object"}, {"entry", "part"}]
         target = self.structured("trace_read", "targets")["items"]
         anchors = self.structured("trace_edit", "put")["items"]["properties"]
         scopes = self.structured("trace_search", "scope")["anyOf"]
@@ -358,6 +381,31 @@ class NativeSchemaTests(unittest.TestCase):
         for schema in converted:
             self.assertEqual(schema["parameters"], self.parameters(schema["name"]))
         self.assertEqual(json.dumps(published, sort_keys=True), before)
+
+    def test_whole_targets_survive_all_properties_required(self):
+        try:
+            from jsonschema import Draft202012Validator
+        except ImportError:
+            self.skipTest("jsonschema is not installed; no dependency installation performed")
+        target = self.structured("trace_read", "targets")["items"]
+        original = json.dumps(target, sort_keys=True)
+        strengthened = json.loads(original)
+        for branch in strengthened["anyOf"]:
+            if branch.get("type") == "object":
+                branch["required"] = list(branch["properties"])
+        validator = Draft202012Validator(strengthened)
+        for address in ({"event": "S/e1", "field": "text"}, {"object": "S/o1"},
+                        {"event": "S/e1", "field": "text", "lines": [1, 2]},
+                        {"object": "S/o1", "lines": [1, 2]},
+                        {"session": "S", "events": [1, 2]},
+                        {"result": "r1", "rows": [0]}, {"entry": "a", "part": "card"}):
+            with self.subTest(address=address):
+                validator.validate(address)
+        self.assertEqual(json.dumps(target, sort_keys=True), original)
+        props = self.parameters("trace_read")["properties"]
+        for name in ("targets", "before", "after", "pair", "line_context", "projection"):
+            self.assertIn("null", props[name]["description"])
+            self.assertIn("cursor", props[name]["description"])
 
     def test_json_schema_accepts_real_payloads_and_rejects_empty_objects(self):
         try:

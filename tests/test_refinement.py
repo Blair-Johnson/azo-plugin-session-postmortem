@@ -114,6 +114,120 @@ class RefinementTests(unittest.TestCase):
         self.assertEqual(page["unavailable"][0]["anchor"], "S/o-missing")
         self.assertIn("note", self.call("trace_open")["capabilities"]["map_kinds"])
 
+    def add_unavailable_search_sources(self):
+        with self.db() as db:
+            db.execute("INSERT INTO sessions VALUES(?,?,?,?,?)", ("T", None, "Other", "fixture", "[]"))
+            db.executemany("INSERT INTO objects VALUES(?,?,?,?,?,?,?)", [
+                ("S/o-missing", "buffer", 0, 0, 0, "S", "Opaque legacy buffer manager"),
+                ("S/o-unrelated", "buffer", 0, 0, 0, "S", "Unrelated missing object"),
+                ("T/o-missing", "buffer", 0, 0, 0, "T", "Other session missing object"),
+            ])
+            db.executemany("INSERT INTO links VALUES(?,?,?)", [
+                ("S/e1", "S/o-missing", "references"),
+                ("S/e1", "T/o-missing", "references"),
+                ("S/e2", "S/o-unrelated", "references"),
+            ])
+
+    def test_search_unavailable_object_zero_hits_vs_readable_zero_hits(self):
+        self.add_unavailable_search_sources()
+        for anchor in ("S/o-missing", {"object": "S/o-missing"},
+                       {"object": "S/o-missing", "lines": [2, 3]}):
+            with self.subTest(anchor=anchor):
+                page = self.call("trace_search", scope={"refs": [anchor]}, query="absent-needle",
+                                 mode="literal", max_chars=1)
+                self.assertEqual(page["hits"], {"source": [], "map": []})
+                self.assertEqual(page["matched_total"], {"source": 0, "map": 0})
+                self.assertIsNone(page["next_cursor"])
+                self.assertEqual(page["unavailable_count"], 1)
+                self.assertEqual(page["unavailable"], [
+                    {"anchor": anchor, "reason": "Opaque legacy buffer manager"}])
+        page = self.call("trace_search", scope={"refs": ["S/o-log"]}, query="absent-needle")
+        self.assertEqual(page["hits"]["source"], [])
+        self.assertEqual(page["unavailable"], [])
+        self.assertEqual(page["unavailable_count"], 0)
+        with self.assertRaisesRegex(ValueError, "unknown object"):
+            self.call("trace_search", scope={"refs": [{"object": "S/not-indexed"}]}, query="absent")
+
+    def test_search_unavailable_effective_workspace_session_and_event_scope(self):
+        self.add_unavailable_search_sources()
+        cases = [
+            (None, {"S/o-missing", "S/o-unrelated", "T/o-missing"}),
+            ({"workspace": True}, {"S/o-missing", "S/o-unrelated", "T/o-missing"}),
+            ({"sessions": ["S"]}, {"S/o-missing", "S/o-unrelated"}),
+            ({"sessions": ["T"]}, {"T/o-missing"}),
+            ({"refs": ["S/e1", "S/o-missing"]}, {"S/o-missing", "T/o-missing"}),
+            ({"refs": [{"session": "S", "events": [1, 1]}]}, {"S/o-missing", "T/o-missing"}),
+        ]
+        for scope, expected in cases:
+            with self.subTest(scope=scope):
+                page = self.call("trace_search", scope=scope, query="absent-needle", on="both")
+                self.assertEqual(page["unavailable_count"], len(expected))
+                self.assertEqual({n["anchor"] for n in page["unavailable"]}, expected)
+
+    def test_search_narrow_scope_does_not_warn_about_referenced_or_unrelated_objects(self):
+        self.add_unavailable_search_sources()
+        field = {"event": "S/e1", "field": "text"}
+        self.call("trace_edit", put=[{"id": "narrow", "kind": "episode", "title": "Slice",
+                                      "anchors": [field]}])
+        result = self.call("trace_query", sql="SELECT ref FROM objects WHERE ref='S/o-log'")["result"]
+        for scope in ({"refs": [field]}, {"refs": [{**field, "lines": [1, 1]}]},
+                      {"refs": ["S/o-log"]}, {"refs": ["S/e3"]},
+                      {"entries": ["narrow"]}, {"result": result}):
+            with self.subTest(scope=scope):
+                page = self.call("trace_search", scope=scope, query="absent-needle")
+                self.assertEqual(page["unavailable"], [])
+                self.assertEqual(page["unavailable_count"], 0)
+
+    def test_map_only_search_does_not_report_source_unavailability(self):
+        self.add_unavailable_search_sources()
+        for scope in (None, {"refs": ["S/o-missing"]}, {"sessions": ["S"]}):
+            with self.subTest(scope=scope):
+                page = self.call("trace_search", scope=scope, query="absent-needle", on="map")
+                self.assertEqual(page["unavailable"], [])
+                self.assertIsNone(page["unavailable_count"])
+
+    def test_search_unavailable_preview_is_bounded_and_deduplicated(self):
+        with self.db() as db:
+            db.executemany("INSERT INTO objects VALUES(?,?,?,?,?,?,?)", [
+                (f"S/missing-{i}", "buffer", 0, 0, 0, "S", "Missing") for i in range(12)])
+        page = self.call("trace_search", query="absent-needle", max_chars=1)
+        self.assertEqual(page["unavailable_count"], 12)
+        self.assertEqual(len(page["unavailable"]), 8)
+        self.assertEqual(page["hits"]["source"], [])
+
+    def test_search_unavailable_metadata_survives_pagination_and_source_changes(self):
+        self.add_unavailable_search_sources()
+        page = self.call("trace_search", query="routine output", mode="literal", page_size=1)
+        expected = page["unavailable"]
+        self.assertEqual(page["unavailable_count"], 3)
+        with self.db() as db:
+            db.execute("UPDATE objects SET reason='Changed reason' WHERE available=0")
+            db.execute("INSERT INTO _content VALUES(?,?,?)", ("S/o-missing", "text", "Now readable"))
+        continued = self.cli("trace_search", cursor=page["next_cursor"], page_size=1200, max_chars=1000000)
+        self.assertEqual(continued["unavailable"], expected)
+        self.assertEqual(continued["unavailable_count"], 3)
+        self.assertIsNone(continued["next_cursor"])
+        self.assertEqual(len(continued["hits"]["source"]), 1198)
+        collapsed = self.call("trace_search", query="Identical success output", mode="literal", collapse="exact")
+        with self.db() as db:
+            occurrences = collapsed["hits"]["source"][0]["occurrences_result"]
+            meta = json.loads(db.execute("SELECT meta FROM _results WHERE id=?", (int(occurrences[1:]),)).fetchone()[0])
+        self.assertEqual(meta["unavailable"], collapsed["unavailable"])
+        self.assertEqual(meta["unavailable_count"], 2)
+
+    def test_legacy_search_result_coverage_remains_unknown(self):
+        page = self.call("trace_search", query="routine output", mode="literal", page_size=1)
+        with self.db() as db:
+            result_id = int(page["result"][1:])
+            meta = json.loads(db.execute("SELECT meta FROM _results WHERE id=?", (result_id,)).fetchone()[0])
+            meta.pop("unavailable")
+            meta.pop("unavailable_count")
+            db.execute("UPDATE _results SET meta=? WHERE id=?", (json.dumps(meta), result_id))
+        continued = self.cli("trace_search", cursor=page["next_cursor"], page_size=1)
+        self.assertTrue(continued["hits"]["source"])
+        self.assertEqual(continued["unavailable"], [])
+        self.assertIsNone(continued["unavailable_count"])
+
     def test_missing_fields_and_unknown_anchors_fail_explicitly(self):
         for anchor in ("S/unknown", {"event": "S/e1", "field": "absent"}):
             with self.subTest(anchor=anchor):
@@ -135,6 +249,55 @@ class RefinementTests(unittest.TestCase):
             self.assertEqual(self.call("trace_read", targets=[{"entry": "stale"}])["blocks"][0]["card"]["id"], "stale")
             with self.db() as db:
                 db.execute("UPDATE map_entries SET anchors='[]' WHERE id='stale'")
+
+    def test_range_errors_report_bounds_and_whole_field_recovery(self):
+        text = "\n".join(f"line {n}" for n in range(1, 20))
+        with self.db() as db:
+            db.execute("UPDATE _content SET text=? WHERE ref='S/e1' AND field='text'", (text,))
+            db.execute("UPDATE _content SET text=? WHERE ref='S/o-log'", (text,))
+        for whole in ({"event": "S/e1", "field": "text"}, {"object": "S/o-log"}):
+            for bounds in ([1, 20], [20, 20]):
+                with self.subTest(whole=whole, bounds=bounds):
+                    with self.assertRaises(ValueError) as caught:
+                        self.call("trace_read", targets=[{**whole, "lines": bounds}], line_context=0)
+                    message = str(caught.exception)
+                    self.assertIn(next(iter(whole.values())), message)
+                    self.assertIn("field='text'", message)
+                    self.assertIn(f"requested={bounds}", message)
+                    self.assertIn("available line count=19", message)
+                    self.assertIn("omit lines to read the whole field", message)
+                    self.assertIn(engine._json(whole), message)
+            recovered = self.call("trace_read", targets=[whole], pair=False)
+            self.assertEqual("".join(b["text"] for b in recovered["blocks"]), text)
+            sliced = self.call("trace_read", targets=[{**whole, "lines": [19, 19]}],
+                               pair=False, line_context=0)
+            self.assertEqual(sliced["blocks"][0]["text"], "line 19")
+
+    def test_rejected_cursor_defaults_preserve_snapshot_and_name_arguments(self):
+        first = self.call("trace_read", targets=[{"object": "S/o-log", "lines": [2, 3]}],
+                          pair=False, line_context=0, max_chars=5)
+        cursor = first["next_cursor"]
+        with self.db() as db:
+            snapshot = db.execute("SELECT * FROM _cursors").fetchall()
+        defaults = {"before": 0, "after": 0, "pair": True,
+                    "line_context": 10, "projection": "content"}
+        for supplied in ({name: value} for name, value in defaults.items()):
+            with self.subTest(supplied=supplied):
+                with self.assertRaises(ValueError) as caught:
+                    self.call("trace_read", cursor=cursor, **supplied)
+                message = str(caught.exception)
+                self.assertIn("arguments: " + next(iter(supplied)), message)
+                self.assertIn("allowed arguments with cursor: cursor, max_chars, output, workspace", message)
+                with self.db() as db:
+                    self.assertEqual(db.execute("SELECT * FROM _cursors").fetchall(), snapshot)
+        # Even a changed source cannot replace the already captured read plan.
+        with self.db() as db:
+            db.execute("UPDATE _content SET text='changed' WHERE ref='S/o-log'")
+        continued = self.call("trace_read", cursor=cursor, max_chars=1000)
+        self.assertEqual(continued["blocks"][0]["char_offset"], 5)
+        delivered = "".join(b["text"] for page in (first, continued) for b in page["blocks"])
+        self.assertEqual(delivered, "routine output 2\nroutine output 3\n")
+        self.assertIsNone(continued["next_cursor"])
 
     def test_lexical_counts_are_complete_before_display_collapse(self):
         for mode in ("literal", "terms"):

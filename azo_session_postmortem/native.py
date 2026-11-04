@@ -170,15 +170,15 @@ def trace_read(
 
     Args:
         workspace: Workspace directory, relative to the agent session cwd.
-        targets: References or anchors: {event:ref,field:text,lines:[lo,hi]}, {object:ref}, {session:ID,events:[lo,hi]}, {entry:ID,part:card|anchors}, or {result:ID,rows:[0,1]}. Lines/events are inclusive 1-based; result rows are 0-based.
-        before: Preceding event count (default 0).
-        after: Following event count (default 0).
-        pair: Include paired tool calls/results (default true).
-        line_context: Extra lines around line anchors (default 10).
+        targets: Whole refs, whole fields {event:ref,field:text}, whole objects {object:ref}, or slices with lines:[lo,hi]. Also {session:ID,events:[lo,hi]}, {entry:ID,part:card|anchors}, or {result:ID,rows:[0,1]}. Lines/events are inclusive 1-based; result rows are 0-based. Omit or use null with cursor.
+        before: Preceding event count (default 0); omit or use null with cursor.
+        after: Following event count (default 0); omit or use null with cursor.
+        pair: Include paired tool calls/results (default true); omit or use null with cursor.
+        line_context: Extra lines around line anchors (default 10); omit or use null with cursor.
         max_chars: Content-text character budget, excluding headers (default 12000).
         output: inline (default) or buffer (requires the host BufferManager).
-        cursor: Continue a read snapshot; only max_chars and output may accompany it.
-        projection: content (default) or all; explicit field anchors remain exact.
+        cursor: Continue an immutable read snapshot using workspace, cursor and optional max_chars/output only. All other arguments must be null or omitted, even default-valued expansion flags.
+        projection: content (default) or all; explicit field anchors remain exact. Omit or use null with cursor.
     """
     return _dispatch("trace_read", workspace, state, targets=targets, before=before,
                      after=after, pair=pair, line_context=line_context,
@@ -240,6 +240,10 @@ _ADDRESS_VARIANTS = [
     _object({"session": _STRING, "events": _RANGE}, ["session", "events"]),
     _object({"result": _STRING, "rows": _array({"type": "integer", "minimum": 0})},
             ["result"]),
+    # Separate whole-content branches survive providers requiring every property.
+    # Keep the richer variants above for slices and existing optional defaults.
+    _object({"event": _STRING, "field": _STRING}, ["event", "field"]),
+    _object({"object": _STRING}, ["object"]),
 ]
 _SOURCE_ANCHOR = {"anyOf": [*_ADDRESS_VARIANTS,
     _object({"entry": _STRING, "part": {"type": "string", "enum": ["anchors"]}},
