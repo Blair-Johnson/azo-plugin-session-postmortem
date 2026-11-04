@@ -81,10 +81,13 @@ class NativeTests(unittest.TestCase):
             self.assertTrue({"session_cwd", "terminal_cwd"} <= component.optional_reads)
         self.assertEqual(set(self.state.tool_schemas), {"trace_open", "trace_query", "trace_search", "trace_read", "trace_edit"})
         props = native.trace_query.schema["function"]["parameters"]["properties"]
-        self.assertEqual(props["params"]["type"], ["object", "null"])
-        self.assertEqual(props["sample"]["type"], ["object", "null"])
+        self.assertEqual(props["params"]["anyOf"][0]["type"], "object")
+        self.assertEqual(set(props["sample"]["anyOf"][0]["properties"]), {"n", "by", "seed"})
         props = native.trace_read.schema["function"]["parameters"]["properties"]
-        self.assertEqual(props["targets"]["items"]["anyOf"], [{"type": "string"}, {"type": "object"}])
+        targets = props["targets"]["anyOf"][0]["items"]["anyOf"]
+        self.assertEqual(targets[0], {"type": "string"})
+        self.assertEqual(len(targets), 6)
+        self.assertTrue(all(v.get("properties") for v in targets[1:]))
         self.assertEqual(props["pair"]["type"], ["boolean", "null"])
         self.assertEqual(props["max_chars"]["type"], ["integer", "null"])
         self.assertIn("buffer_manager", native.trace_read.optional_reads)
@@ -191,6 +194,37 @@ class NativeTests(unittest.TestCase):
         self.assertFalse(found["hits"]["source"])
         self.assertFalse(self.state.entries)
 
+
+    def test_nested_arguments_and_partial_patch_semantics(self):
+        self.open_source()
+        refs = self.event_refs()
+        anchor = {"event": refs[0], "field": "text", "lines": [1, 1]}
+        self.invoke("trace_edit", put=[{
+            "id": "a", "kind": "episode", "title": "Keep title", "anchors": [anchor],
+            "note": "clear me", "tags": ["old"], "pinned": True,
+            "fields": {"keep": {"nested": [1, False, None]}, "drop": "old"},
+        }, {"id": "b", "kind": "note", "title": "Other"}], link=[{
+            "id": "edge", "from": "a", "to": "b", "label": "related", "note": None,
+        }])
+        self.invoke("trace_edit", put=[{
+            "id": "a", "note": None, "tags": None, "pinned": None,
+            "details_path": None, "fields": {"drop": None, "new": 2},
+            "remove_anchors": [anchor], "add_anchors": [{"session": "S", "events": [1, 1]}],
+        }])
+        selected = self.invoke("trace_query", sql="SELECT * FROM map_entries WHERE id=:entry",
+                               params={"entry": "a"}, sample={"n": 1, "by": ["kind"], "seed": 7})
+        card = selected["rows"][0]
+        self.assertEqual(card["title"], "Keep title")
+        self.assertEqual(card["note"], "")
+        self.assertEqual(json.loads(card["tags"]), [])
+        self.assertEqual(card["pinned"], 0)
+        self.assertEqual(json.loads(card["fields"]), {"keep": {"nested": [1, False, None]}, "new": 2})
+        self.assertTrue(self.invoke("trace_read", targets=[{"result": selected["result"], "rows": [0]}])["blocks"])
+        self.assertTrue(self.invoke("trace_search", scope={"refs": [anchor]}, query="Inspect")["hits"]["source"])
+        self.invoke("trace_edit", put=[{"id": "a", "fields": None}], unlink=["edge"], delete=["b"])
+        card = self.invoke("trace_query", sql="SELECT fields FROM map_entries WHERE id=:entry",
+                           params={"entry": "a"})["rows"][0]
+        self.assertEqual(json.loads(card["fields"]), {})
     @unittest.skipUnless(ZOO_AVAILABLE, "agent_zoo is not installed; fresh host-loader test requires it")
     @unittest.skipUnless(ZOO_AVAILABLE, "agent_zoo is not installed; loader test needs the full host")
     def test_fresh_host_loader_with_symlink_and_unrelated_cwd(self):
@@ -233,6 +267,156 @@ class NativeTests(unittest.TestCase):
         self.assertEqual(completed.returncode, 0, completed.stdout + completed.stderr)
         self.assertEqual(json.loads(completed.stdout), sorted(component.name for component in native.TOOLS))
 
+
+
+@unittest.skipUnless(HOST_AVAILABLE, "agent_utils is not installed; run in the Agent Zoo host environment")
+class NativeSchemaTests(unittest.TestCase):
+    def parameters(self, name):
+        return getattr(native, name).schema["function"]["parameters"]
+
+    def structured(self, name, parameter):
+        schema = self.parameters(name)["properties"][parameter]
+        self.assertEqual(schema["anyOf"][1], {"type": "null"})
+        return schema["anyOf"][0]
+
+    def test_all_operation_parameters_are_model_visible(self):
+        expected = {
+            "trace_open": "workspace sessions descendants refresh page_size cursor",
+            "trace_query": "workspace sql params saved sample page_size max_chars cursor save_as",
+            "trace_search": "workspace scope query mode on collapse top_k page_size max_chars saved cursor save_as projection",
+            "trace_read": "workspace targets before after pair line_context max_chars output cursor projection",
+            "trace_edit": "workspace put delete link unlink",
+        }
+        for name, names in expected.items():
+            with self.subTest(tool=name):
+                schema = self.parameters(name)
+                self.assertEqual(set(schema["properties"]), set(names.split()))
+                self.assertEqual(schema["required"], ["workspace"])
+        patch = self.structured("trace_edit", "put")["items"]
+        self.assertEqual(set(patch["properties"]), {
+            "id", "kind", "title", "note", "anchors", "tags", "fields", "pinned",
+            "details_path", "add_anchors", "remove_anchors",
+        })
+        self.assertEqual(patch["required"], ["id"])
+        self.assertFalse(patch["additionalProperties"])
+        self.assertEqual(patch["properties"]["kind"]["enum"], ["episode", "note"])
+        for name in ("note", "tags", "fields", "pinned", "details_path"):
+            self.assertIn({"type": "null"}, patch["properties"][name]["anyOf"])
+        self.assertTrue(patch["properties"]["fields"]["anyOf"][0]["additionalProperties"])
+        relation = self.structured("trace_edit", "link")["items"]
+        self.assertEqual(set(relation["properties"]), {"id", "from", "to", "label", "note"})
+        self.assertEqual(relation["required"], ["id", "from", "to", "label"])
+        self.assertFalse(relation["additionalProperties"])
+        self.assertEqual(set(self.structured("trace_query", "sample")["properties"]), {"n", "by", "seed"})
+        self.assertEqual(self.structured("trace_query", "sample")["required"], ["n"])
+        self.assertEqual(self.structured("trace_query", "params")["additionalProperties"]["type"],
+                         ["string", "number", "boolean", "null"])
+
+    def test_nested_addresses_scopes_and_enums(self):
+        expected = [{"event", "field", "lines"}, {"object", "lines"}, {"session", "events"},
+                    {"result", "rows"}, {"entry", "part"}]
+        target = self.structured("trace_read", "targets")["items"]
+        anchors = self.structured("trace_edit", "put")["items"]["properties"]
+        scopes = self.structured("trace_search", "scope")["anyOf"]
+        self.assertEqual([set(v["properties"]) for v in scopes],
+                         [{"workspace"}, {"sessions"}, {"entries"}, {"refs"}, {"result"}])
+        self.assertTrue(all(v["required"] == list(v["properties"]) and not v["additionalProperties"] for v in scopes))
+        self.assertEqual(scopes[0]["properties"]["workspace"]["enum"], [True])
+        for schema in [target, scopes[3]["properties"]["refs"]["items"],
+                       *(anchors[name]["items"] for name in ("anchors", "add_anchors", "remove_anchors"))]:
+            variants = schema["anyOf"]
+            self.assertEqual(variants[0], {"type": "string"})
+            self.assertEqual([set(v["properties"]) for v in variants[1:]], expected)
+            self.assertTrue(all(v["required"] and not v["additionalProperties"] for v in variants[1:]))
+            lines = variants[1]["properties"]["lines"]
+            self.assertEqual((lines["minItems"], lines["maxItems"]), (2, 2))
+            self.assertEqual(lines["items"], {"type": "integer", "minimum": 1})
+            self.assertEqual(variants[4]["properties"]["rows"]["items"]["minimum"], 0)
+        self.assertEqual(target["anyOf"][-1]["properties"]["part"]["enum"], ["card", "anchors"])
+        self.assertEqual(anchors["anchors"]["items"]["anyOf"][-1]["properties"]["part"]["enum"], ["anchors"])
+        for name, parameter, values in (
+            ("trace_search", "mode", ["terms", "literal", "regex"]),
+            ("trace_search", "on", ["source", "map", "both"]),
+            ("trace_search", "collapse", ["none", "exact"]),
+            ("trace_search", "projection", ["content", "all"]),
+            ("trace_read", "projection", ["content", "all"]),
+            ("trace_read", "output", ["inline", "buffer"]),
+        ):
+            self.assertEqual(self.structured(name, parameter)["enum"], values)
+
+    @unittest.skipUnless(ZOO_AVAILABLE, "provider conversion requires the Agent Zoo host")
+    def test_actual_host_provider_conversion_preserves_nested_schemas(self):
+        from agents.llm import _scrub_fn_tool_schemas, _tools_for_responses
+        state = State()
+        state.tool_schemas = {}
+        for component in native.TOOLS:
+            component(state)
+        published = [value["schema"] for value in state.tool_schemas.values()]
+        before = json.dumps(published, sort_keys=True)
+        converted = _tools_for_responses(_scrub_fn_tool_schemas(published))
+        self.assertEqual(len(converted), 5)
+        for schema in converted:
+            self.assertEqual(schema["parameters"], self.parameters(schema["name"]))
+        self.assertEqual(json.dumps(published, sort_keys=True), before)
+
+    def test_json_schema_accepts_real_payloads_and_rejects_empty_objects(self):
+        try:
+            from jsonschema import Draft202012Validator
+        except ImportError:
+            self.skipTest("jsonschema is not installed; no dependency installation performed")
+        validators = {}
+        for component in native.TOOLS:
+            schema = self.parameters(component.name)
+            Draft202012Validator.check_schema(schema)
+            validators[component.name] = Draft202012Validator(schema)
+        addresses = ["S/e1", {"event": "S/e1"},
+                     {"event": "S/e1", "field": "text", "lines": [1, 2]},
+                     {"object": "S/o1", "lines": [1, 1]}, {"session": "S", "events": [1, 2]},
+                     {"result": "r1", "rows": [0, 3]}, {"entry": "a", "part": "anchors"}]
+        valid = [
+            ("trace_open", {"sessions": ["S"], "descendants": False}),
+            ("trace_query", {"sql": "SELECT :name", "params": {"name": "a", "n": 2, "f": 1.5, "b": False, "nil": None},
+                             "sample": {"n": 0, "by": ["kind"], "seed": 7}}),
+            ("trace_read", {"targets": [*addresses, {"entry": "a"}, {"entry": "a", "part": "card"}]}),
+            ("trace_edit", {"put": [{"id": "a"}, {"id": "b", "kind": "episode", "title": "B", "anchors": addresses,
+                            "fields": {"anything": {"deep": [1, "two", None, {"flag": True}]}}}],
+                            "link": [{"id": "edge", "from": "a", "to": "b", "label": "related", "note": None}],
+                            "delete": ["old"], "unlink": ["old-edge"]}),
+            ("trace_edit", {"put": [{"id": "a", "note": None, "tags": None, "fields": None,
+                                     "pinned": None, "details_path": None}]}),
+            ("trace_edit", {"put": [{"id": "a", "fields": {"delete-key": None},
+                                     "add_anchors": addresses, "remove_anchors": addresses}]}),
+            *( ("trace_search", {"scope": scope}) for scope in (
+                {"workspace": True}, {"sessions": ["S"]}, {"entries": ["a"]},
+                {"refs": addresses}, {"result": "r1"})),
+        ]
+        for name, args in valid:
+            with self.subTest(tool=name, payload=args):
+                validators[name].validate({"workspace": "study", **args})
+        for name, validator in validators.items():
+            validator.validate({"workspace": "study"})
+            validator.validate({key: "study" if key == "workspace" else None
+                                for key in self.parameters(name)["properties"]})
+        invalid = [
+            ("trace_edit", {"put": [{}]}), ("trace_edit", {"link": [{}]}),
+            ("trace_edit", {"put": [{"id": "a", "kind": "finding"}]}),
+            ("trace_edit", {"put": [{"id": "a", "title": None}]}),
+            ("trace_edit", {"put": [{"id": "a", "typo": "value"}]}),
+            ("trace_edit", {"put": [{"id": "a", "anchors": [{"entry": "b", "part": "card"}]}]}),
+            ("trace_read", {"targets": [{}]}),
+            ("trace_read", {"targets": [{"event": "S/e1", "object": "S/o1"}]}),
+            ("trace_read", {"targets": [{"event": "S/e1", "lines": [0, 2]}]}),
+            ("trace_read", {"targets": [{"session": "S", "events": [1]}]}),
+            ("trace_read", {"targets": [{"result": "r1", "rows": [-1]}]}),
+            ("trace_query", {"sample": {}}), ("trace_query", {"sample": {"n": -1}}),
+            ("trace_query", {"params": {"not-a-scalar": {"nested": True}}}),
+            ("trace_search", {"scope": {"workspace": False}}),
+            ("trace_search", {"scope": {"sessions": ["S"], "entries": ["a"]}}),
+            ("trace_search", {"mode": "similar"}), ("trace_read", {"output": "file"}),
+        ]
+        for name, args in invalid:
+            with self.subTest(tool=name, invalid=args):
+                self.assertFalse(validators[name].is_valid({"workspace": "study", **args}))
 
 if __name__ == "__main__":
     unittest.main()

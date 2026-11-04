@@ -200,7 +200,7 @@ def trace_edit(
 
     Args:
         workspace: Workspace directory, relative to the agent session cwd.
-        put: Entry patches; new entries require id, kind (episode/note), title. Optional note, anchors, tags, fields, pinned, details_path, add_anchors, remove_anchors. Episodes require anchors.
+        put: Entry patches; new entries require id, kind (episode/note), title. Omitted fields stay unchanged; null clears note, tags, fields, pinned, details_path. Episodes require anchors. Use anchors OR add_anchors/remove_anchors, not both.
         delete: Map entry IDs to delete.
         link: Relation objects with id, from, to, label and optional note.
         unlink: Relation IDs to remove.
@@ -209,24 +209,109 @@ def trace_edit(
                      link=link, unlink=unlink)
 
 
-# The host decorator currently handles scalars/lists but treats dict and multi-type
-# unions as strings. Supply accurate JSON fragments on OUR tool schemas, without
-# changing the host generator or replacing the explicit native signatures.
+# The host decorator cannot infer dictionaries or mixed unions. Bare objects also
+# leave providers with no model-visible keys. Keep explicit schemas here, without
+# changing the engine or coercing JSON strings into structured arguments.
 def _structured_parameter(component, name, fragment):
     properties = component.schema["function"]["parameters"]["properties"]
     properties[name] = {"description": properties[name]["description"], **fragment}
 
 
-for _component, _name in ((trace_query, "params"), (trace_query, "sample"),
-                          (trace_search, "scope")):
-    _structured_parameter(_component, _name, {"type": ["object", "null"]})
-for _name in ("put", "link"):
-    _structured_parameter(trace_edit, _name,
-                          {"type": ["array", "null"], "items": {"type": "object"}})
-_structured_parameter(trace_read, "targets", {
-    "type": ["array", "null"],
-    "items": {"anyOf": [{"type": "string"}, {"type": "object"}]},
-})
+def _object(properties, required):
+    return {"type": "object", "properties": properties,
+            "required": required, "additionalProperties": False}
+
+
+def _array(items, **constraints):
+    return {"type": "array", "items": items, **constraints}
+
+
+def _nullable(schema):
+    return {"anyOf": [schema, {"type": "null"}]}
+
+
+_STRING = {"type": "string"}
+_STRINGS = _array(_STRING)
+_RANGE = _array({"type": "integer", "minimum": 1}, minItems=2, maxItems=2)
+_ADDRESS_VARIANTS = [
+    _STRING,
+    _object({"event": _STRING, "field": _STRING, "lines": _RANGE}, ["event"]),
+    _object({"object": _STRING, "lines": _RANGE}, ["object"]),
+    _object({"session": _STRING, "events": _RANGE}, ["session", "events"]),
+    _object({"result": _STRING, "rows": _array({"type": "integer", "minimum": 0})},
+            ["result"]),
+]
+_SOURCE_ANCHOR = {"anyOf": [*_ADDRESS_VARIANTS,
+    _object({"entry": _STRING, "part": {"type": "string", "enum": ["anchors"]}},
+            ["entry", "part"]),
+]}
+_READ_TARGET = {"anyOf": [*_ADDRESS_VARIANTS,
+    _object({"entry": _STRING, "part": {"type": "string", "enum": ["card", "anchors"]}},
+            ["entry"]),
+]}
+_ANCHORS = _array(_SOURCE_ANCHOR)
+
+# These two dictionaries intentionally have caller-chosen keys. Do not close them
+# with additionalProperties=False: that advertises only {} and loses valid data.
+# SQL bindings are SQLite scalar values; authored fields allow arbitrary JSON.
+_PARAMS = {"type": "object", "additionalProperties": {
+    "type": ["string", "number", "boolean", "null"],
+}}
+_FIELDS = {"type": "object", "additionalProperties": True}
+_PATCH = _object({
+    "id": {"type": "string", "minLength": 1},
+    "kind": {"type": "string", "enum": ["episode", "note"]},
+    "title": _STRING,
+    "note": _nullable(_STRING),
+    "anchors": _ANCHORS,
+    "tags": _nullable(_STRINGS),
+    "fields": {**_nullable(_FIELDS), "description":
+               "Authored JSON object with arbitrary keys; merges by key. Null values "
+               "delete keys; null clears all fields. Omit to preserve existing fields."},
+    "pinned": _nullable({"type": "boolean"}),
+    "details_path": _nullable(_STRING),
+    "add_anchors": _ANCHORS,
+    "remove_anchors": _ANCHORS,
+}, ["id"])
+_RELATION = _object({
+    "id": {"type": "string", "minLength": 1},
+    "from": {"type": "string", "minLength": 1},
+    "to": {"type": "string", "minLength": 1},
+    "label": {"type": "string", "minLength": 1},
+    "note": _nullable(_STRING),
+}, ["id", "from", "to", "label"])
+_SAMPLE = _object({
+    "n": {"type": "integer", "minimum": 0},
+    "by": _STRINGS,
+    "seed": {"type": ["number", "string", "boolean", "null"]},
+}, ["n"])
+_SCOPE = {"anyOf": [
+    _object({"workspace": {"type": "boolean", "enum": [True]}}, ["workspace"]),
+    _object({"sessions": _STRINGS}, ["sessions"]),
+    _object({"entries": _STRINGS}, ["entries"]),
+    _object({"refs": _ANCHORS}, ["refs"]),
+    _object({"result": _STRING}, ["result"]),
+]}
+
+for _component, _name, _schema in (
+    (trace_query, "params", _PARAMS),
+    (trace_query, "sample", _SAMPLE),
+    (trace_search, "scope", _SCOPE),
+    (trace_edit, "put", _array(_PATCH)),
+    (trace_edit, "link", _array(_RELATION)),
+    (trace_read, "targets", _array(_READ_TARGET)),
+):
+    _structured_parameter(_component, _name, _nullable(_schema))
+for _component, _name, _values in (
+    (trace_search, "mode", ["terms", "literal", "regex"]),
+    (trace_search, "on", ["source", "map", "both"]),
+    (trace_search, "collapse", ["none", "exact"]),
+    (trace_search, "projection", ["content", "all"]),
+    (trace_read, "projection", ["content", "all"]),
+    (trace_read, "output", ["inline", "buffer"]),
+):
+    _structured_parameter(_component, _name,
+                          _nullable({"type": "string", "enum": _values}))
 
 TOOLS = (trace_open, trace_query, trace_search, trace_read, trace_edit)
 
