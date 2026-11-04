@@ -1,0 +1,27 @@
+{
+  "format_version": 2,
+  "meta": {"session_id": "example-parser", "created_at": "2026-01-01T00:00:00Z"},
+  "attrs": {"session_title": "Synthetic parser investigation"},
+  "components": {},
+  "entries": [
+    {"index": 0, "system_generated": false, "messages": [
+      {"role": "user", "content": "Build a parser for complete captures only."}
+    ]},
+    {"index": 1, "messages": [
+      {"role": "assistant", "content": "I will inspect the header and payload boundaries."}
+    ]},
+    {"index": 2, "tool_calls": [
+      {"id": "inspect-1", "name": "terminal_run", "parsed_args": {"command": "capture inspect example.bin"},
+       "result": "header_bytes=12 payload_bytes=88 declared_bytes=100 available_bytes=64 status=partial", "error": false}
+    ]},
+    {"index": 3, "system_generated": false, "messages": [
+      {"role": "user", "content": "Actually, preserve partial captures too; report the missing payload."}
+    ]},
+    {"index": 4, "messages": [
+      {"role": "assistant", "content": "The complete-capture assumption no longer holds. I will preserve the header and mark the unavailable payload."}
+    ]},
+    {"index": 5, "system_generated": true, "messages": [
+      {"role": "user", "content": "Terminal command completed: partial-capture tests passed."}
+    ]}
+  ]
+}

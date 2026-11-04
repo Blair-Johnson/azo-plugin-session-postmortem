@@ -1,0 +1,22 @@
+[workspace]
+name = "azo-plugin-session-postmortem"
+version = "0.1.0"
+channels = ["conda-forge"]
+platforms = ["linux-64", "osx-arm64", "osx-64"]
+
+[feature.dev.dependencies]
+python = ">=3.11"
+setuptools = ">=68"
+
+[feature.dev.tasks]
+test = "python -m unittest discover -s tests -p 'test_*.py' -v"
+cli = "python -m azo_session_postmortem"
+
+[environments]
+default = ["dev"]
+
+[tool.agent-zoo.plugin]
+name = "azo-plugin-session-postmortem"
+common = ["src/session_postmortem.py"]
+default = []
+rlm = []

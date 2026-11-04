@@ -1,0 +1,17 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "azo-plugin-session-postmortem"
+version = "0.1.0"
+description = "Search agent-session contents and build a durable investigator-authored map"
+readme = "README.md"
+requires-python = ">=3.11"
+dependencies = []
+
+[project.scripts]
+azo-postmortem = "azo_session_postmortem.cli:main"
+
+[tool.setuptools.packages.find]
+include = ["azo_session_postmortem*"]

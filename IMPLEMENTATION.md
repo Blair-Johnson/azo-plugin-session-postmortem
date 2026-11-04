@@ -1,0 +1,15 @@
+# Implementation boundary
+
+This repository promotes the tested Agent Zoo transcript-investigation prototype, not a new analytics framework. Preserve exactly five operation names: trace_open, trace_query, trace_search, trace_read, trace_edit. There are no hidden model calls, automatic episodes, summary tools or comparison tools.
+
+The reusable package lives in `azo_session_postmortem/`. `engine.dispatch(tool, arguments)` accepts the existing JSON-compatible arguments and returns dictionaries; core code remains independent of agent_utils. `source.py` imports Agent Zoo only when reading managed session sources. Ordinary JSON fixtures and pinned JSON sources work without it. The CLI lives in `cli.py`, exposed through `python -m azo_session_postmortem` and the `azo-postmortem` packaging script.
+
+The native adapter is `azo_session_postmortem/native.py`. It registers five native tools with explicit typed arguments, useful Args docstrings, declared state access and no import-time filesystem writes. Relative workspace paths follow the harness workspace, not backend process startup cwd. `output="buffer"` must return an actual managed buffer ID rather than pretending a packet filename is an ID. It may adapt the engine's ordinary packet file through the standard BufferManager APIs. No opaque source unpickling, monkeypatching or direct transcript mutation.
+
+A source-plugin shim `src/session_postmortem.py` is listed under `common` in pixi.toml, so interactive agents and RLMs get the same tools. It must resolve its real repository location when symlinked by the plugin installer. Load the package from that repository without depending on a particular checkout cwd or editing sys.path to mix environments. Package installation is optional for CLI use; avoid registering a second entry-point copy of the plugin.
+
+The external workspace SQLite format stays compatible with existing prototype workspaces and cursors. Retain content/all projections, nullable system_generated, bounded response previews, explicit unreadable-source notices, separate raw/map search, stable result selections and caller-authored incremental map edits. Do not create a storage migration framework or expand the operation count.
+
+Portable tests live in tests/ and use temporary sources/workspaces. Host integration tests may skip clearly when agent_utils/agent_zoo are unavailable, but must run against the actual installed host during final validation. Existing CTF sessions, raw transcripts, local workspace databases, private paths and answer files are not copied into the distributed repository. Document methodology in generic examples instead.
+
+The public native layer uses the standard Feature/Tool interfaces and the host path resolver. Its JSON schemas explicitly preserve nested objects and mixed string/object anchors. Buffer export preflights the host manager, then registers a scratch copy of the ordinary packet. Workspace connections are opened per operation; no database connection or custom analysis object is stored on harness state. Source installations and optional Python package installations do not register duplicate entry-point plugins.

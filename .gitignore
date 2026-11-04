@@ -1,0 +1,10 @@
+.pixi/
+.work/
+__pycache__/
+*.py[cod]
+*.egg-info/
+build/
+dist/
+.DS_Store
+trace.sqlite3
+trace.sqlite3-*
