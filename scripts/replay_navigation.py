@@ -1,4 +1,4 @@
-"""Known-case producer navigation regression, not an investigator efficacy trial."""
+"""Historical engine producer-navigation compatibility, not native validation."""
 import argparse
 import hashlib
 import json
@@ -8,7 +8,7 @@ import sys
 import tempfile
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
-from scripts.replay_cooccur import NativeClient
+from scripts.replay_cooccur import EngineClient
 from scripts.check_workspace import map_state
 
 PARENT = '0ca0982e-7080-472a-8c28-67f3ad2c16f0'
@@ -28,7 +28,7 @@ def source_digest(db):
 
 
 def main():
-    from azo_session_postmortem import native
+    from azo_session_postmortem import engine
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('workspace', type=Path)
     parser.add_argument('--output', type=Path)
@@ -40,11 +40,11 @@ def main():
             before, raw_before = map_state(source), source_digest(source)
             with sqlite3.connect(root / 'trace.sqlite3') as target:
                 source.backup(target)
-        client = NativeClient(root)
+        client = EngineClient(root)
         opened = client.call('trace_open')
         assert opened['counts']['sessions'] == 58
         handoff = client.call('trace_read', targets=[{'event': f'{PARENT}/e2712',
-            'field': 'text'}], pair=False, line_context=0, output='compact', max_chars=8000)
+            'field': 'text'}], pair=False, line_context=0, output='text', max_chars=8000)
         links = [row for row in handoff['session_navigation']
                  if row['dst'] == CHILD and row['kind'] == 'rlm_output']
         assert links, 'Recorded handoff producer not exposed'
@@ -71,8 +71,9 @@ def main():
         report = dict(status='passed', copied_workspace_only=True, map_unchanged=True,
             source_tables_unchanged=True, handoff=f'{PARENT}/e2712', child=CHILD,
             launch_evidence=link['anchor'], child_receipts=[row['ref'] for row in children['rows']],
-            missing_field_diagnostic=True, calls=client.calls, response_chars=client.response_chars,
-            native_module=native.__file__, interpretation='Known-case retrieval regression, not efficacy.')
+            missing_field_diagnostic=True, calls=client.calls, engine_response_chars=client.response_chars,
+            comparison='engine_navigation_compatibility', response_format='engine_json',
+            engine_module=engine.__file__, interpretation='Historical engine compatibility only; not native validation or efficacy.')
         if args.output:
             args.output.parent.mkdir(parents=True, exist_ok=True)
             args.output.write_text(json.dumps(report, indent=2) + '\n')

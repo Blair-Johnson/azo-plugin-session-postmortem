@@ -1,4 +1,7 @@
-"""Replay identical native reads against disposable index copies; compare evidence, not reasoning."""
+"""Historical engine-only inline/compact JSON comparison on disposable index copies.
+
+This does not measure native tool responses, which are plain text.
+"""
 import argparse
 import json
 from pathlib import Path
@@ -54,8 +57,7 @@ def reference_state(root, page):
 
 
 def main():
-    from agent_utils import State, ToolCall
-    from azo_session_postmortem import native
+    from azo_session_postmortem import engine
     from scripts.check_workspace import map_state
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('workspace', type=Path)
@@ -66,7 +68,7 @@ def main():
     assert isinstance(request, dict) and not {'workspace', 'inspect', 'output'} & request.keys()
     original = args.workspace.expanduser().resolve() / 'trace.sqlite3'
     with tempfile.TemporaryDirectory(prefix='postmortem-compact-') as temp:
-        roots, states = {}, {}
+        roots = {}
         for mode in ('inline', 'compact', 'switch'):
             root = Path(temp) / mode
             root.mkdir()
@@ -74,19 +76,12 @@ def main():
                 before = map_state(source)
                 with sqlite3.connect(root / 'trace.sqlite3') as target:
                     source.backup(target)
-            state = State()
-            state.session_cwd, state.tool_schemas = str(root), {}
-            roots[mode], states[mode] = root, state
+            roots[mode] = root
         def invoke(mode, arguments):
-            call_args = dict(arguments, workspace='.')
-            call = ToolCall(id='compact-replay', name='trace_read',
-                            raw_args=json.dumps(call_args), parsed_args=call_args)
-            state = states[mode]
-            state.pending_tool_calls = [call]
-            native.trace_read(state)
-            if call.error:
-                raise RuntimeError(call.result)
-            return json.loads(call.result), len(call.result)
+            page = engine.dispatch('trace_read', dict(arguments, workspace=str(roots[mode])))
+            # Match the historical wrapper's JSON serialization, not native text.
+            serialized = json.dumps(page, ensure_ascii=False)
+            return page, len(serialized)
         totals = dict(pages=0, inline_chars=0, compact_chars=0, text_chars=0)
         current = request
         while True:
@@ -112,7 +107,8 @@ def main():
         totals['saved_chars'] = totals['inline_chars'] - totals['compact_chars']
         print(json.dumps(dict(label=args.label, **totals, same_evidence_and_navigation=True,
                               maps_unchanged=True, copied_workspace_only=True,
-                              native_module=native.__file__, python=sys.executable)))
+                              comparison="engine_inline_vs_compact_json",
+                              engine_module=engine.__file__, python=sys.executable)))
 
 
 if __name__ == '__main__':

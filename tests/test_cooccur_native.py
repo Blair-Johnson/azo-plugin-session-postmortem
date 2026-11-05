@@ -15,6 +15,8 @@ HOST_AVAILABLE = importlib.util.find_spec("agent_utils") is not None
 ZOO_AVAILABLE = importlib.util.find_spec("agent_zoo") is not None
 if HOST_AVAILABLE:
     from agent_utils import State, ToolCall
+    from agent_utils.files.buffer_manager import BufferManager
+    import test_native as native_fixtures
     from azo_session_postmortem import native
 
 
@@ -41,15 +43,9 @@ class CooccurNativeTests(SyntheticFixture, unittest.TestCase):
         self.state = State()
         self.state.session_cwd = str(self.root)
         self.state.tool_schemas = {}
+        self.state.buffer_manager = BufferManager()
 
-    def invoke(self, name, *, expect_error=False, **arguments):
-        arguments = {"workspace": "study", **arguments}
-        call = ToolCall(id="cooccur-native", name=name,
-                        raw_args=json.dumps(arguments), parsed_args=arguments)
-        self.state.pending_tool_calls = [call]
-        self.assertIs(getattr(native, name)(self.state), self.state)
-        self.assertEqual(call.error, expect_error, call.result)
-        return call.result if expect_error else json.loads(call.result)
+    invoke = native_fixtures.NativeTests.invoke if HOST_AVAILABLE else None
 
     def selections(self):
         self.invoke("trace_open", sessions=["source.json"], descendants=False)
@@ -59,66 +55,63 @@ class CooccurNativeTests(SyntheticFixture, unittest.TestCase):
 
     def join_args(self):
         seed, witness = self.selections()
-        return {"seed": {"result": seed["result"]}, "against": [{
-            "name": "receipt", "selection": {"result": witness["result"]},
+        return {"seed": {"result": seed["id"]}, "against": [{
+            "name": "receipt", "selection": {"result": witness["id"]},
             "before": 0, "after": 3,
         }]}
 
     def test_top_level_nulls_are_omitted_without_coercing_nested_values(self):
         seed = {"result": "r1", "rows": []}
         condition = {"name": "receipt", "selection": {"result": "r2"}, "before": 0, "after": 1}
-        with patch.object(native.engine, "dispatch", return_value={"ok": True}) as dispatch:
-            self.invoke("trace_cooccur", seed=seed, against=[condition], page_size=None,
-                        max_chars=None, cursor=None, saved=None, save_as=None)
+        envelope = {"document": {"operation": "trace_cooccur", "id": "C1",
+                    "workspace": str(self.root / "study"), "title": "Join", "blocks": []},
+                    "text": "Complete", "path": str(self.root / "result.txt"), "preview_chars": 6000}
+        Path(envelope["path"]).write_text(envelope["text"])
+        with patch.object(native.cache, "dispatch", return_value=envelope) as dispatch:
+            self.invoke("trace_cooccur", seed=seed, against=[condition],
+                        preview_chars=None, saved=None, save_as=None)
         dispatch.assert_called_once_with("trace_cooccur", {
             "workspace": str(self.root / "study"), "seed": seed, "against": [condition]})
-        with patch.object(native.engine, "dispatch", return_value={}) as dispatch:
+        with patch.object(native.cache, "dispatch", return_value=envelope) as dispatch:
             self.invoke("trace_cooccur", seed={"result": "r1", "rows": None}, against=[condition])
         self.assertIsNone(dispatch.call_args.args[1]["seed"]["rows"])
 
     def test_matched_unmatched_witness_navigation_and_seed_only_reads(self):
         args = self.join_args()
-        joined = self.invoke("trace_cooccur", **args, page_size=1, save_as="fixed-inputs")
-        self.assertEqual(joined["operation"], "cooccur")
-        self.assertEqual(joined["status"], "complete")
+        joined = self.invoke("trace_cooccur", **args, save_as="fixed-inputs")
+        self.assertEqual(joined["operation"], "trace_cooccur")
         self.assertEqual(joined["counts"], {
             "seed_events": 3, "matched_seed_events": 2, "unmatched_seed_events": 1})
         self.assertTrue((self.root / "study" / "trace.sqlite3").is_file())
-        self.assertEqual(joined["rows"][0]["row"], 0)
-        self.assertEqual(joined["rows"][0]["conditions"][0]["witness_count"], 2)
-        next_page = self.invoke("trace_cooccur", cursor=joined["next_cursor"],
-                                seed=None, against=None, saved=None, save_as=None,
-                                page_size=2, max_chars=10000)
-        self.assertEqual(next_page["result"], joined["result"])
-        self.assertEqual(next_page["counts"], joined["counts"])
-        self.assertEqual(next_page["rows"][0]["row"], 1)
-        self.assertIsNone(next_page["next_cursor"])
-        unmatched = self.invoke("trace_query", cursor=joined["unmatched_cursor"])
-        self.assertEqual(unmatched["result"], joined["unmatched_result"])
-        self.assertEqual(unmatched["rows"][0]["failed_conditions"], ["receipt"])
-        self.assertEqual(unmatched["rows"][0]["conditions"][0]["status"], "outside_window")
-        seed_read = self.invoke("trace_read", targets=[{"result": joined["result"], "rows": [0]}],
+        self.assertEqual(sum(b["group"] == "matched" for b in joined["blocks"]), 2)
+        self.assertEqual(sum(b["group"] == "unmatched" for b in joined["blocks"]), 1)
+        matched_blocks = [b for b in joined["blocks"] if b["group"] == "matched"]
+        unmatched_blocks = [b for b in joined["blocks"] if b["group"] == "unmatched"]
+        self.assertEqual(len(matched_blocks[0]["links"]), 2)
+        self.assertIn("candidate three", unmatched_blocks[0]["text"])
+        self.assertTrue(any("nearest outside window" in link["label"] and "receipt beta" in link["text"]
+                            for link in unmatched_blocks[0]["links"]))
+        seed_read = self.invoke("trace_read", targets=[{"result": joined["id"], "group": "matched", "rows": [0]}],
                                 pair=False, line_context=0)
         self.assertEqual([block["text"] for block in seed_read["blocks"]], ["candidate one"])
-        witnesses = joined["rows"][0]["conditions"][0]["witnesses_result"]
-        witness_read = self.invoke("trace_read", targets=[{"result": witnesses}],
-                                   pair=False, line_context=0)
-        self.assertEqual([block["text"] for block in witness_read["blocks"]],
-                         ["receipt alpha", "receipt beta"])
-        witness_search = self.invoke("trace_search", scope={"result": witnesses},
-                                     query="receipt", mode="literal")
-        self.assertEqual(witness_search["matched_total"]["source"], 2)
+        unmatched = self.invoke("trace_read", targets=[{"result": joined["id"], "group": "unmatched"}],
+                                pair=False, line_context=0)
+        self.assertEqual([block["text"] for block in unmatched["blocks"]], ["candidate three"])
+        witnesses = {"result": joined["id"], "group": "witnesses"}
+        witness_read = self.invoke("trace_read", targets=[witnesses], pair=False, line_context=0)
+        self.assertEqual({block["text"] for block in witness_read["blocks"]},
+                         {"receipt alpha", "receipt beta"})
+        witness_search = self.invoke("trace_search", scope=witnesses, query="receipt", mode="literal")
+        self.assertEqual(len(witness_search["blocks"]), 2)
         edited = self.invoke("trace_edit", put=[{
-            "id": "receipts", "kind": "note", "title": "Selected witnesses",
-            "anchors": [{"result": witnesses}],
+            "id": "receipts", "kind": "note", "title": "Selected witnesses", "anchors": [witnesses],
         }])
         self.assertEqual(edited["created"], ["receipts"])
         rerun = self.invoke("trace_cooccur", saved="fixed-inputs", seed=None, against=None)
         self.assertEqual(rerun["counts"], joined["counts"])
-        self.assertEqual(rerun["inputs"], joined["inputs"])
-        self.assertNotEqual(rerun["result"], joined["result"])
+        self.assertNotEqual(rerun["id"], joined["id"])
 
-    def test_invalid_nested_and_cursor_arguments_use_normal_tool_error_path(self):
+    def test_invalid_nested_and_removed_cursor_use_normal_tool_error_path(self):
         args = self.join_args()
         for invalid in (
             {"seed": {**args["seed"], "rows": None}},
@@ -127,37 +120,32 @@ class CooccurNativeTests(SyntheticFixture, unittest.TestCase):
             {"against": [{**args["against"][0], "before": True}]},
             {"against": [{**args["against"][0], "name": "seed"}]},
             {"against": [{**args["against"][0], "selection": None}]},
+            {"seed": {"items": ["missing-item"]}},
+            {"seed": {"result": args["seed"]["result"], "group": "bogus"}},
         ):
             with self.subTest(invalid=invalid):
                 self.invoke("trace_cooccur", **{**args, **invalid}, expect_error=True)
-        joined = self.invoke("trace_cooccur", **args, page_size=1)
-        for extra in ({"seed": args["seed"]}, {"against": args["against"]},
-                      {"saved": "missing"}, {"save_as": "no-write"}):
-            with self.subTest(extra=extra):
-                self.invoke("trace_cooccur", cursor=joined["next_cursor"],
-                            **extra, expect_error=True)
-        continued = self.invoke("trace_cooccur", cursor=joined["next_cursor"])
-        self.assertEqual(continued["counts"], joined["counts"])
+        self.invoke("trace_cooccur", **args, cursor="c1", expect_error=True)
+        self.invoke("trace_cooccur", **args, saved="missing", expect_error=True)
 
     def test_explicit_empty_rows_does_not_select_all(self):
         args = self.join_args()
         args["seed"]["rows"] = []
         result = self.invoke("trace_cooccur", **args)
         self.assertEqual(result["counts"]["seed_events"], 0)
-        self.assertEqual(result["rows"], [])
-        self.assertIsNone(result["next_cursor"])
-        self.assertIsNone(result["unmatched_cursor"])
+        self.assertEqual(result["blocks"], [])
 
     def test_nested_schema_is_explicit_and_closed(self):
         params = native.trace_cooccur.schema["function"]["parameters"]
         self.assertEqual(params["required"], ["workspace"])
         self.assertEqual(set(params["properties"]), {
-            "workspace", "seed", "against", "page_size", "max_chars", "cursor", "saved", "save_as"})
+            "workspace", "seed", "against", "saved", "save_as", "preview_chars"})
         props = params["properties"]
         seed = props["seed"]["anyOf"][0]
         self.assertEqual(props["seed"]["anyOf"][1], {"type": "null"})
         variants = seed["anyOf"]
-        self.assertEqual([set(v["properties"]) for v in variants], [{"result"}, {"result", "rows"}])
+        self.assertEqual([set(v["properties"]) for v in variants], [{"result"}, {"result", "rows"},
+                          {"result", "group"}, {"result", "group", "rows"}, {"items"}])
         for variant in variants:
             self.assertEqual(variant["required"], list(variant["properties"]))
             self.assertFalse(variant["additionalProperties"])
@@ -189,10 +177,11 @@ class CooccurNativeTests(SyntheticFixture, unittest.TestCase):
 
         require_all(schema)
         validator = Draft202012Validator(schema)
-        base = dict(workspace="study", page_size=None, max_chars=None,
-                    cursor=None, saved=None, save_as=None)
+        base = dict(workspace="study", preview_chars=None, saved=None, save_as=None)
         for selector in ({"result": "r1"}, {"result": "r1", "rows": []},
-                         {"result": "r1", "rows": [0, 2]}):
+                         {"result": "r1", "rows": [0, 2]}, {"items": ["S1-H001"]},
+                         {"result": "C1", "group": "unmatched"},
+                         {"result": "C1", "group": "witnesses", "rows": [0]}):
             payload = {**base, "seed": selector, "against": [{"name": "receipt",
                 "selection": selector, "before": 0, "after": 2}]}
             validator.validate(payload)

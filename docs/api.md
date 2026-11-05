@@ -1,8 +1,100 @@
 # Tool and Python API
 
-All operations require a `workspace` directory. CLI arguments are JSON objects; Python uses `dispatch("trace_read", {...})`; native tools expose the same named arguments. Native relative paths follow the active harness workspace. CLI/Python relative paths follow their process cwd. Native `state` is injected by the harness and never a model argument.
+All operations require a `workspace` directory. CLI arguments are JSON objects; Python uses `dispatch("trace_read", {...})`. Native relative paths follow the active harness workspace. CLI/Python relative paths follow their process cwd. Native `state` is injected by the harness and never a model argument.
 
-No operation interprets the session for you. The map stores only semantic text and relationships supplied in edit requests. Query and search results are durable selections, not live queries; saved recipes are rerun explicitly. Source content and authored annotations are kept separate.
+## Native indexed-buffer interface
+
+The five retrieval tools return useful inline text plus a generated managed-buffer
+pointer. The buffer contains the complete selected result, including material omitted
+from the preview, and is saved under the workspace's `results` directory. `trace_edit`
+returns an acknowledgment without a retrieval buffer. Native retrieval requires the
+host BufferManager.
+
+```python
+trace_open(workspace, sessions=None, descendants=True, refresh=False,
+           preview_chars=6000)
+trace_query(workspace, sql=None, params=None, sample=None, saved=None,
+            save_as=None, preview_chars=6000)
+trace_search(workspace, query=None, scope=None, mode="terms", context_lines=2,
+             on="source", collapse="none", projection="content",
+             follow_object_links=True, saved=None, save_as=None, preview_chars=6000)
+trace_read(workspace, targets, before=0, after=0, pair=True, line_context=10,
+           projection="content", preview_chars=12000)
+trace_cooccur(workspace, seed=None, against=None, saved=None, save_as=None,
+              preview_chars=6000)
+trace_edit(workspace, put=None, delete=None, link=None, unlink=None)
+```
+
+These are effective defaults. Nullable native defaults let saved recipes retain their
+settings; omit selection options when using `saved`. `preview_chars` is a nonnegative
+integer, not a boolean. It budgets inline presentation, not selection or buffer
+contents; zero suppresses inline evidence, not materialization. Native schemas have
+no `cursor`, `page_size`, `max_chars`, `output`, `inspect` or `top_k`.
+
+### Previews and complete buffers
+
+Search previews show up to six match-centered passages, then compact index entries as
+space permits. Search buffer blocks contain matching source lines plus `context_lines`;
+item IDs still select exact matches. Query buffers retain complete chosen cell values,
+including SQL columns named `row`. Read previews allocate space to distinct requested
+targets before contextual expansion: short targets can be complete, long whole fields
+use head/tail excerpts, and anchored excerpts begin at the match. Open prioritizes
+pinned notes and includes catalog, map, recipe and prior-result pointers. Co-occurrence
+shows counts, matched and unmatched examples, and condition links with witness IDs,
+signed deltas or nearest-outside labels, and literal excerpts.
+
+Every full buffer has a title/workspace, `## INDEX`, entries with exact buffer line
+ranges, and `## ITEM_ID` detail headings. Blocks and relations are complete for that
+operation: search is not a whole-event export, and co-occurrence contains relations
+and short excerpts rather than full event bodies. A read contains all requested
+passages and expansion, without the structured API's per-page block cap. Source text
+is preserved; generated headings and buffer line numbers are navigation, not anchors.
+Use the generated pointer with `view`, `grep` or `chunk_sources`; a known item ID can
+also go straight to `trace_read` without first traversing its buffer.
+
+For SQL joins over `result_items`, use the `SQL membership: rN` pointer in a search,
+query or co-occurrence buffer header as `result_items.result_id`. Native IDs such as
+`S17` remain tool selectors, not SQL table values. This pointer is omitted from inline
+previews; the complete buffer provides it when the structural join is needed.
+### Item IDs and source selectors
+
+IDs are workspace-scoped immutable aliases. Hypothetical forms include `S17-H001`
+(search hit), `Q18-R001` (query row), `R19-B001` (read block), `C20-M001`, `C20-U001`,
+`C20-W001` (matched, unmatched, witness), and `O21-...` (open items). Use actual returned
+IDs, not inferred numbering. A whole result alias such as `S17` retains its original
+membership. Canonical source addresses and result-row selectors still work.
+
+- Read or annotate items: `targets=["S17-H001"]` or `anchors=["S17-H001"]`.
+- Scope search or a join selection: `{"items":["S17-H001","S17-H004"]}`.
+- Select a join group: `{"result":"C20","group":"matched"}`, `"unmatched"` or
+  `"witnesses"`; optional `rows` uses zero-based retained positions. The plural
+  selector `witnesses` corresponds to individual `witness` blocks.
+
+Matched/unmatched selections contain seed anchors only; witnesses require their own
+IDs or group. Aliases preserve co-occurrence's no-implicit-object-expansion rule.
+`follow_object_links=False` still suppresses only implicit expansion from ordinary
+whole events: explicit objects and workspace/session objects remain. Explicit field
+and line scopes remain exact. Aggregate-only rows have values to view but cannot be
+selected as source evidence.
+
+Identity is persisted in the workspace database, survives reopen or a workspace copy,
+and must not silently rebind after source refresh. Missing or foreign IDs fail. Map
+edits resolve aliases to real anchors immediately. Copied/chunked buffers are text
+copies, not new source identities; retain the workspace and exact item/source IDs for
+durable evidence. Buffer line numbers are not trace source selectors.
+
+## Structured Python/CLI API
+
+The remainder documents the existing structured engine, not native request shapes.
+Python `dispatch` returns dictionaries; the CLI returns JSON. They retain pagination,
+cursors, `max_chars`, read inspection and `inline`/`compact`/`buffer` layouts.
+File-backed buffer output is not a managed host buffer. Search accepts both
+`follow_object_links` and legacy `include_references`; saved recipes retain their
+policy. New native aliases and delivery controls belong to the native cache adapter,
+not a replacement structured dispatch contract.
+
+No operation interprets a session. Query/search results are durable selections;
+recipes are rerun explicitly. Sources and investigator-authored annotations stay separate.
 
 ## Open and resume
 
@@ -15,7 +107,7 @@ trace_open(workspace, sessions=None, descendants=True, refresh=False,
 
 Returns `workspace`, source descriptions/warnings, `capabilities`, `counts`, pinned/recent entry previews, saved query recipes and `next_cursor`. Page the catalog with the cursor and optional `page_size`, without source-changing arguments. Previews are short; read complete cards when resuming. Capabilities advertise modes, map kinds, projections and packet behavior.
 
-Refresh preserves stored map/result records but does not rebase sequence-based anchors or remove previously indexed descendants. If source ordering changes, a still-valid sequence address can change meaning. Use a pinned source for a fixed investigation; reread evidence after refresh. Invalid stale anchors fail explicitly, while the authored card remains readable so it can be repaired.
+Structured refresh preserves stored map/result records but does not rebase legacy sequence-based anchors or remove previously indexed descendants. If source ordering changes, a still-valid sequence address can change meaning. Use a pinned source for a fixed investigation; reread evidence after refresh. Invalid stale anchors fail explicitly, while the authored card remains readable so it can be repaired.
 ## Structural selection and sampling
 
 ```python
@@ -49,10 +141,10 @@ Query/search `max_chars` budgets the visible row JSON rather than the outer resp
 trace_search(workspace, scope=None, query=None, mode="terms", on="source",
              collapse="none", top_k=100, page_size=12, max_chars=6000,
              saved=None, cursor=None, save_as=None, projection="content",
-             include_references=True)
+             follow_object_links=True)
 ```
 
-A scope has exactly one key: `{"workspace":true}`, `{"sessions":["A","B"]}`, `{"refs":[...]}`, `{"result":"r17"}`, or `{"entries":["episode-id"]}`. Omitted scope means workspace. Entry scopes expand source anchors, not note prose. With boolean `include_references=True` (the default), ordinary whole-event scopes include directly referenced objects (searchable content or unavailable notices). `False` suppresses only this implicit expansion: explicit objects remain, as do objects inherently selected by workspace/session scopes. Explicit fields and slices remain within their field and lines. Co-occurrence result selectors never implicitly follow object references under either setting, as detailed below. Session scopes do not silently expand to other sessions. New saved search recipes persist this policy; legacy recipes default to true. Omit it when paging a cursor or rerunning `saved`, rather than overriding the retained policy.
+A scope has exactly one key: `{"workspace":true}`, `{"sessions":["A","B"]}`, `{"refs":[...]}`, `{"result":"r17"}`, or `{"entries":["episode-id"]}`. Omitted scope means workspace. Entry scopes expand source anchors, not note prose. With boolean `follow_object_links=True` (the default; legacy `include_references` is also accepted by dispatch), ordinary whole-event scopes include directly referenced objects (searchable content or unavailable notices in structured output). `False` suppresses only this implicit expansion: explicit objects remain, as do objects inherently selected by workspace/session scopes. Explicit fields and slices remain within their field and lines. Co-occurrence result selectors never implicitly follow object references under either setting, as detailed below. Session scopes do not silently expand to other sessions. New saved search recipes persist this policy; legacy recipes default to true. Omit it when paging a cursor or rerunning `saved`, rather than overriding the retained policy.
 
 `mode` is `literal`, `regex` or `terms`. Terms use simple per-line token-frequency ranking. `similar` is unsupported and never silently falls back to lexical matches. `top_k` is reserved for the unsupported similarity path; current modes retain the complete matching selection. `on` is `source`, `map` or `both`; `both` returns separate hit lists, never a shared relevance ranking. Source search does not search your interpretation in place of raw evidence.
 
@@ -97,8 +189,7 @@ selects none. Indexes refer to the original result, not positions on a displayed
 
 Names must be nonempty, unique and not `seed`. Windows and row indexes must be
 nonnegative integers, not booleans. Extra keys and nested nulls are invalid, including
-`rows:null`. Native wrappers omit top-level optional nulls; the explicit nested schema
-has separate result-only and result-plus-rows variants.
+`rows:null`. Result selectors distinguish omitted `rows` from an explicit empty list.
 
 Each candidate seed event must satisfy every condition in the same session. A witness
 qualifies when `-before <= witness.seq - seed.seq <= after`; boundaries are inclusive.
@@ -196,7 +287,7 @@ trace_read(workspace, targets=None, before=0, after=0, pair=True,
            projection="content", inspect=False)
 ```
 
-Targets can be whole refs (`"A/e92"`), event ranges (`{"session":"A","events":[90,108]}`), event fields (`{"event":"A/e92","field":"text","lines":[2,9]}`), object slices (`{"object":"A/o_buffer","lines":[18,37]}`), selected result rows (`{"result":"r17","rows":[0,3]}`), or map cards (`{"entry":"framing","part":"card"}`). Field-anchor lines are optional: `{"event":"A/e92","field":"text"}` reads the whole field, and `{"object":"A/o_buffer"}` reads the whole object. Native schemas advertise these as separate no-lines variants, so bounds need not be guessed. Out-of-range slices are rejected without clipping; the error reports the reference, field, requested bounds, available line count and a whole-field selector. For a map entry use `part="anchors"` to expand its selected source material instead of reading its interpretation. Ranges and line numbers are inclusive; result row IDs are zero-based.
+Targets can be whole refs (`"A/e92"`), event ranges (`{"session":"A","events":[90,108]}`), event fields (`{"event":"A/e92","field":"text","lines":[2,9]}`), object slices (`{"object":"A/o_buffer","lines":[18,37]}`), selected result rows (`{"result":"r17","rows":[0,3]}`), or map cards (`{"entry":"framing","part":"card"}`). Field-anchor lines are optional: `{"event":"A/e92","field":"text"}` reads the whole field, and `{"object":"A/o_buffer"}` reads the whole object. Out-of-range slices are rejected without clipping; the error reports the reference, field, requested bounds, available line count and a whole-field selector. For a map entry use `part="anchors"` to expand its selected source material instead of reading its interpretation. Ranges and line numbers are inclusive; result row IDs are zero-based.
 
 Unknown event-field errors identify the offending source ref, requested field, sorted
 available fields and a valid target example. All targets are validated before read
@@ -207,11 +298,11 @@ Search-result rows preserve their exact matched slices. Query rows need a naviga
 
 `before`/`after` add neighboring events within the same session, `pair=True` adds the recorded call/result counterpart, and `line_context` expands line slices. Requested slices precede whole targets and added context. Overlapping windows merge. References are listed rather than recursively expanded. Read projection follows the search rules above.
 
-Returns content `blocks`, shared source attribution in `sources`, delivered slices (normally derived from blocks in compact output), a bounded `remaining` preview and `remaining_count`, reference previews/counts, unavailable-target previews/counts, and `next_cursor`. A read page contains at most 64 blocks; previews contain at most eight entries. Longer reference lists supply `references_result` and a `references_cursor` pageable with `trace_query`. The complete pending read plan persists behind the read cursor. Continue with `workspace`, `cursor` and optional `max_chars`/`output` only. Omit `targets`, `before`, `after`, `pair`, `line_context` and `projection` (native tools also accept null); even explicit default values for those selection/expansion arguments are rejected. Omit or null `inspect` as well; explicit `inspect=false` is inert and accepted, but `inspect=true` is initial-only. Errors name the prohibited supplied arguments and allowed continuation arguments. Rejected calls leave the immutable read plan unchanged.
+Returns content `blocks`, shared source attribution in `sources`, delivered slices (normally derived from blocks in compact output), a bounded `remaining` preview and `remaining_count`, reference previews/counts, unavailable-target previews/counts, and `next_cursor`. A read page contains at most 64 blocks; previews contain at most eight entries. Longer reference lists supply `references_result` and a `references_cursor` pageable with `trace_query`. The complete pending read plan persists behind the read cursor. Continue with `workspace`, `cursor` and optional `max_chars`/`output` only. Omit `targets`, `before`, `after`, `pair`, `line_context` and `projection`; even explicit default values for those selection/expansion arguments are rejected. Omit or null `inspect` as well; explicit `inspect=false` is inert and accepted, but `inspect=true` is initial-only. Errors name the prohibited supplied arguments and allowed continuation arguments. Rejected calls leave the immutable read plan unchanged.
 
 `max_chars` is a content-character budget. `text_chars` reports consumed content and `packet_chars` reports the compact inline response or exported text-packet size; metadata, escaping and CLI pretty printing can make the full response larger. Long lines continue using character offsets rather than being silently clipped. A large early target can still delay later targets. Delivery completeness concerns stored content, not whether an original terminal output was already truncated.
 
-`output="buffer"` exports the bounded page. In the CLI/library the `buffer` and `buffer_path` values identify the packet file. In the harness, `buffer` is a real managed scratch-buffer ID and `buffer_path` identifies the exported packet file. The scratch buffer contains a copy; editing it does not rewrite the packet file. Use ordinary buffer tools to inspect or delegate it. Native export requires the host BufferManager; it never disguises a filename as a managed ID. Known unavailable targets are reported separately from pending delivery. Reading has no interpretive side effect on the map.
+`output="buffer"` exports the bounded page. In the CLI/library, `buffer` and `buffer_path` identify the packet file containing the rendered text page. Known unavailable targets are reported separately from pending delivery. Reading has no interpretive side effect on the map.
 
 ### Recorded session navigation
 
@@ -258,7 +349,7 @@ receipt's observed session, not proven ancestry. Output reservations establish n
 completion nor correctness, even when object bytes exist. Author semantic relations
 with `trace_edit`; recorded links do not supply those interpretations.
 
-### Compact read layout
+### Structured Python/CLI compact read layout
 
 `output="compact"` opts into a display-only layout with `packet_format="compact_read_json_v1"`. It contains the same ordered source text and map-card bodies, anchors, source attribution (`kind`, `role`, `tool`, `system_generated`), content budget, pending previews/counts, unavailable notices, references and navigation as legacy `output="inline"`. It does not summarize or filter evidence, and does not move visible references behind extra calls.
 
@@ -274,8 +365,9 @@ Inline remains the default, including continuation after a compact page. Choose 
 `inspect=True` resolves the same targets, pairing, neighboring events, line context,
 projection, ordering and overlap deduplication as an ordinary read, but returns costs
 rather than source bodies. It defaults to false and is supported only on an initial
-request with `output="inline"`; inspection with a read cursor, compact or buffer output is
-rejected. `max_chars` remains the simulated read-text budget, not the inspection
+request with `output="inline"` in Python/CLI;
+inspection with a read cursor or buffer output is rejected, as is structured compact
+inspection. `max_chars` remains the simulated read-text budget, not the inspection
 response budget. Inspection does not classify relevance, summarize evidence or
 silently exclude source kinds.
 
@@ -305,8 +397,8 @@ To read selected plan rows without re-expanding them:
 This is a normal read, not continuation of the inspection response. Inspection
 retains the selection and estimate, not a guarantee that changed sources or map
 cards still have the same contents or cost; inspect again after such changes.
-On ordinary read-cursor continuation, omit `inspect` (or use null through the native
-wrapper). Explicit `inspect=false` is also accepted as inert; `inspect=true` is rejected.
+On ordinary read-cursor continuation, omit `inspect`. Explicit `inspect=false` is
+also accepted as inert; `inspect=true` is rejected.
 The response's `predicted_text_chars` is the expected first-page text charge, excluding
 metadata and the inspection preview itself.
 
@@ -339,6 +431,6 @@ Two episodes can overlap or contain disjoint source ranges. Splitting, merging, 
 
 ## Errors and practical limits
 
-The CLI returns JSON errors on stderr with exit status 2; the native adapter uses the harness's ordinary tool error path. Embedding mode is explicitly unsupported. Unknown fields/addresses and malformed selections fail rather than broadening silently. Missing referenced content is different from an invalid address. Source warnings and unavailable reasons must be checked when interpreting negative search results.
+The CLI returns JSON errors on stderr with exit status 2; the native adapter uses the harness's ordinary tool error path. Embedding mode is explicitly unsupported. Unknown fields/addresses and malformed selections fail rather than broadening silently. Missing referenced content is different from an invalid address. The bundled skill describes how to interpret bounded or incomplete evidence; native responses do not repeat general caveats on each call.
 
 The index never executes saved tools or loads arbitrary pickled session objects. JSON-readable buffers and saved call/result text can be searched, but opaque legacy buffer managers, binary attachments and every historical buffer version are outside this implementation. Original sessions are not edited. Workspace indexes and optional CLI logs contain copied source text; treat them as sensitive and avoid publishing them with code.

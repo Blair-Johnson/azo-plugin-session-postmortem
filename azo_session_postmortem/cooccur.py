@@ -303,7 +303,7 @@ def _page(db, result, offset, page_size, max_chars):
 
 
 def trace_cooccur(db, workspace, seed=None, against=None, page_size=10,
-                  max_chars=6000, cursor=None, saved=None, save_as=None):
+                  max_chars=6000, cursor=None, saved=None, save_as=None, *, _materialize=False):
     """Join exact retained anchors by inclusive seed-relative event windows.
 
     Dispatch owns the transaction: any validation or safety-limit error rolls
@@ -353,4 +353,4 @@ def trace_cooccur(db, workspace, seed=None, against=None, page_size=10,
     e._save_query(db, save_as, 'cooccur', {'seed': seed, 'against': against}, result)
     if saved is not None:
         db.execute('UPDATE saved_queries SET last_result=? WHERE name=?', (result, saved))
-    return _page(db, result, 0, page_size, max_chars)
+    return result if _materialize else _page(db, result, 0, page_size, max_chars)

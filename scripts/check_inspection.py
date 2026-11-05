@@ -1,4 +1,4 @@
-"""Compare inspection predictions with native reads on a disposable workspace copy."""
+"""Historical engine inspection compatibility on a disposable workspace copy."""
 import argparse
 from collections import defaultdict
 import json
@@ -29,8 +29,7 @@ def delivered_costs(blocks):
     return dict(costs)
 
 def main():
-    from agent_utils import State, ToolCall
-    from azo_session_postmortem import native
+    from scripts.replay_cooccur import EngineClient
     from scripts.check_workspace import map_state
 
     parser = argparse.ArgumentParser(description=__doc__)
@@ -48,19 +47,8 @@ def main():
             with sqlite3.connect(study / "trace.sqlite3") as target:
                 before = map_state(source)
                 source.backup(target)
-        state = State()
-        state.session_cwd = temporary
-        state.tool_schemas = {}
-
-        def invoke(name, **arguments):
-            arguments["workspace"] = "study"
-            call = ToolCall(id="inspection-replay", name=name,
-                            raw_args=json.dumps(arguments), parsed_args=arguments)
-            state.pending_tool_calls = [call]
-            getattr(native, name)(state)
-            if call.error:
-                raise RuntimeError(call.result)
-            return json.loads(call.result)
+        client = EngineClient(study)
+        invoke = client.call
 
         opened = invoke("trace_open")
         plan = invoke("trace_read", **request, inspect=True)
@@ -79,11 +67,18 @@ def main():
         delivered = delivered_costs(actual["blocks"])
         assert sum(predicted.values()) == actual["text_chars"]
         assert {k: v for k, v in predicted.items() if v} == {k: v for k, v in delivered.items() if v}
+        packet = invoke("trace_read", **request, output="buffer")
+        assert Path(packet["buffer"]).is_file()
+        with open(packet["buffer_path"], encoding="utf-8", newline="") as saved:
+            packet_text = saved.read()
+        assert packet_text and len(packet_text) == packet["packet_chars"]
         assert "workflow_guide" not in opened["capabilities"]
         with sqlite3.connect(study / "trace.sqlite3") as target:
             assert before == map_state(target)
         print(json.dumps({"copied_workspace_only": True, "map_unchanged": True,
-            "prediction_matches_native_delivery": True, "plan_rows": len(rows),
+            "comparison": "engine_inspection_compatibility",
+            "prediction_matches_engine_delivery": True, "plan_rows": len(rows),
+            "engine_response_chars": client.response_chars, "engine_packet_file": True,
             "predicted_text_chars": sum(predicted.values()), "actual_text_chars": actual["text_chars"],
             "fully_deferred_rows": plan["fully_deferred_rows"],
             "partially_delivered_rows": plan["partially_delivered_rows"],

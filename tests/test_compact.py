@@ -350,35 +350,27 @@ class NativeCompactTests(unittest.TestCase):
     open_source = native_fixtures.NativeTests.open_source
     event_refs = native_fixtures.NativeTests.event_refs
 
-    def test_schema_and_compact_without_buffer_manager(self):
+    def test_schema_removes_compact_and_requires_managed_delivery(self):
         self.open_source()
         props = native_fixtures.native.trace_read.schema["function"]["parameters"]["properties"]
-        self.assertEqual(props["output"]["anyOf"][0]["enum"], ["inline", "compact", "buffer"])
-        self.assertIn("compact", props["output"]["description"])
         self.assertEqual(set(props), {"workspace", "targets", "before", "after", "pair", "line_context",
-                                     "max_chars", "output", "cursor", "projection", "inspect"})
+                                      "projection", "preview_chars"})
         ref = self.event_refs()[0]
         del self.state.buffer_manager
-        compact = self.invoke("trace_read", targets=[ref], output="compact", pair=False)
-        inline = self.invoke("trace_read", targets=[ref], output=None, pair=False)
-        self.assertEqual(normalize_read(compact), normalize_read(inline))
-        self.assertEqual(compact["packet_chars"], len(engine._json(compact)))
+        error = self.invoke("trace_read", targets=[ref], pair=False, expect_error=True)
+        self.assertIn("BufferManager", error)
         self.assertFalse(hasattr(self.state, "buffer_manager"))
-        self.assertFalse((self.root / "study" / "packets").exists())
         self.assertFalse(self.state.entries)
 
-    def test_native_compact_inspect_rejected_and_continuation_defaults_inline(self):
+    def test_native_full_buffer_replaces_compact_pagination(self):
         self.open_source()
         ref = self.event_refs()[0]
-        before = (self.root / "study" / "trace.sqlite3").read_bytes()
-        error = self.invoke("trace_read", targets=[ref], output="compact", inspect=True, expect_error=True)
-        self.assertIn('requires output="inline"', error)
-        self.assertEqual((self.root / "study" / "trace.sqlite3").read_bytes(), before)
-        first = self.invoke("trace_read", targets=[ref], output="compact", max_chars=5)
-        rest = self.invoke("trace_read", cursor=first["next_cursor"], targets=None, pair=None, inspect=None)
-        self.assertEqual(rest["packet_format"], "compact_json")
-        same = self.invoke("trace_read", cursor=first["next_cursor"], output="compact", inspect=False)
-        self.assertEqual(normalize_read(rest), normalize_read(same))
+        self.invoke("trace_read", targets=[ref], output="compact", expect_error=True)
+        first = self.invoke("trace_read", targets=[ref], preview_chars=5)
+        full = self.last_text
+        self.assertIn(first["blocks"][0]["text"], full)
+        self.assertTrue(self.last_buffer.startswith("buf_"))
+        self.invoke("trace_read", targets=[ref], cursor="c1", expect_error=True)
 
 
 if __name__ == "__main__":

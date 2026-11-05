@@ -23,10 +23,17 @@ Optional metadata metrics (successful, recognized responses only):
 Navigation counts are exposure, not unique associations or evidence of use.
 Repeated response pages contribute again; duplicate links to the same result ref
 are still counted once. Unknown metadata has no numeric total contribution.
-Per-call include_references/output are sanitized explicit arguments (null means
-absent/invalid), distinct from effective response policy. include_references_{true,
-false} counts explicit trace_search requests; output_compact counts explicit
-trace_read requests, even on errors or missing results.
+Per-call include_references/follow_object_links/output are sanitized explicit
+arguments (null means absent/invalid), distinct from effective response policy.
+include_references_{true,false} and follow_object_links_{true,false} count the
+respective explicit trace_search arguments without aliasing or inferring defaults;
+output_compact/output_text count explicit trace_read requests, even on errors or
+missing results.
+Plain native text is counted as text_responses/text_response_chars, not malformed
+JSON. Structured metadata is unavailable: no counts, bodies, buffer exports, or
+navigation exposure are inferred from prose. JSON-looking broken containers or
+strings and empty responses remain malformed; valid legacy JSON accounting is
+unchanged. Text coverage uses unknown counters, never numeric exposure zeros.
 No metric implies benefit, graph-following, or reading a delivered body.
 """
 import argparse
@@ -100,7 +107,20 @@ def metrics(tool, text):
     try:
         body = json.loads(text)
     except (ValueError, TypeError):
-        return m + Counter(malformed=1)
+        # Native text is a supported transport. Retain detection of damaged
+        # legacy JSON without trying to recover metadata from prose.
+        stripped = text.lstrip()
+        if not stripped or stripped.startswith(('{', '[', '"')):
+            return m + Counter(malformed=1)
+        m.update(text_responses=1, text_response_chars=len(text),
+                 structured_metadata_unavailable=1)
+        if tool == 'trace_search':
+            m.update(search_scope_metrics({}))
+        elif tool == 'trace_read':
+            m.update(navigation_metrics({}))
+            m.update(unknown_text_chars=1, unknown_packet_chars=1,
+                     unknown_inline_source_chars=1, unknown_read_delivery_pages=1)
+        return m
     if not isinstance(body, dict):
         return m + Counter(unknown=1)
     if body.get('error') or body.get('isError') is True:
@@ -155,15 +175,20 @@ def account(rows, fetch):
             inspect = args.get('inspect') is True
             include = args.get('include_references')
             include = include if type(include) is bool else None
+            follow = args.get('follow_object_links')
+            follow = follow if type(follow) is bool else None
             output = args.get('output')
-            output = output if output in ('inline', 'compact', 'buffer') else None
+            output = output if output in ('text', 'inline', 'compact', 'buffer') else None
             calls[ref] = dict(ref=ref, session=sid, tool=tool, inspect=inspect,
-                              include_references=include, output=output, results=[])
+                              include_references=include, follow_object_links=follow,
+                              output=output, results=[])
             total.update(calls=1, inspect_true=int(inspect))
             if tool == 'trace_search' and include is not None:
                 total['include_references_' + str(include).lower()] += 1
-            if tool == 'trace_read' and output == 'compact':
-                total['output_compact'] += 1
+            if tool == 'trace_search' and follow is not None:
+                total['follow_object_links_' + str(follow).lower()] += 1
+            if tool == 'trace_read' and output in ('compact', 'text'):
+                total['output_' + output] += 1
         if result is None:
             total['missing_results'] += 1
         elif result not in seen:
@@ -202,6 +227,7 @@ def collect(workspace):
 def self_test():
     read = lambda b: metrics('trace_read', json.dumps(b))
     assert metrics('trace_query', '{')['malformed'] == 1
+    assert metrics('trace_query', 'Query result r1: 0 rows')['text_responses'] == 1
     assert metrics('trace_query', '[]')['unknown'] == 1
     assert metrics('trace_query', 'ERROR: failure')['errors'] == 1
     assert read({'plan_result': 'r1', 'known_text_chars': 900, 'rows': [{'text_chars': 900}]})['read_text_chars'] == 0

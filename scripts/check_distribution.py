@@ -19,11 +19,14 @@ def main():
         assert skill in names
         skill_text = archive.read(skill).decode("utf-8")
         assert "name: session-postmortem" in skill_text
-        assert "inspect" in skill_text
+        assert "preview_chars" in skill_text
+        assert "azo_session_postmortem/cache.py" in names
+        assert "azo_session_postmortem/cache_render.py" in names
         assert "trace_cooccur" in skill_text
         assert "azo_session_postmortem/navigation.py" in names
-        assert "include_references" in skill_text
-        assert "session_navigation" in skill_text
+        assert "azo_session_postmortem/render.py" in names
+        assert "follow_object_links" in skill_text
+        assert "session_links" in skill_text
         assert "azo_session_postmortem/skills/session-postmortem/references/recipes.md" in names
         entries = next(name for name in names if name.endswith("entry_points.txt"))
         assert "azo-postmortem = azo_session_postmortem.cli:main" in archive.read(entries).decode()
@@ -89,11 +92,30 @@ def main():
         search = {'workspace': ws, 'scope': {'refs': ['P/e2']},
                   'query': 'object_only_marker', 'mode': 'literal'}
         assert call('trace_search', search)['matched_total']['source'] == 1
+        assert call('trace_search', {**search, 'follow_object_links': False})['matched_total']['source'] == 0
         assert call('trace_search', {**search, 'include_references': False})['matched_total']['source'] == 0
         nav = call('trace_read', {'workspace': ws, 'targets': [{'event': 'P/e2', 'field': 'text'}],
                                   'pair': False, 'line_context': 0})['session_navigation']
         assert any(row['dst'] == child and not row['indexed'] for row in nav)
         assert call('trace_open', {'workspace': ws})['counts']['sessions'] == 1
+        cache_program = ("import sys,json; sys.path.insert(0,sys.argv[1]); "
+                         "from azo_session_postmortem.cache import dispatch; "
+                         "print(json.dumps(dispatch(sys.argv[2],json.loads(sys.argv[3]))))")
+        def cache_call(operation, arguments):
+            proc = subprocess.run([sys.executable, '-I', '-c', cache_program, str(wheel),
+                                   operation, json.dumps(arguments)], cwd=temporary,
+                                  capture_output=True, text=True, check=True)
+            return json.loads(proc.stdout)
+        cached = cache_call('trace_search', {'workspace': args['workspace'],
+            'query': 'header and payload', 'mode': 'literal', 'preview_chars': 0})
+        hits = [b for b in cached['document']['blocks'] if b['group'] == 'hit']
+        assert hits and '## INDEX' in cached['text']
+        assert Path(cached['path']).read_bytes() == cached['text'].encode('utf-8')
+        expanded = cache_call('trace_read', {'workspace': args['workspace'],
+            'targets': [hits[0]['id']], 'pair': False, 'line_context': 0})
+        assert 'header and payload' in expanded['text']
+        reopened = cache_call('trace_open', {'workspace': args['workspace']})
+        assert cached['document']['id'] in reopened['text']
     print(json.dumps({"wheel": str(wheel), "isolated_cli_smoke": "passed",
                       "bundled_skill": "session-postmortem", "inspection_smoke": "passed",
                       "console_entrypoint": "azo-postmortem", "tool_count": 6,

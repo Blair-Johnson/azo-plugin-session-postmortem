@@ -46,15 +46,19 @@ def main():
             for tool in tools:
                 if "workspace" not in tool["parameters"] or "state" in tool["parameters"]:
                     raise RuntimeError(f"{name}: invalid tool schema: {tool}")
-            read_tool = next(tool for tool in tools if tool["name"] == "trace_read")
-            if "inspect" not in read_tool["parameters"]:
-                raise RuntimeError(f"{name}: read inspection is not model-visible")
+            retired = {"cursor", "page_size", "max_chars", "output", "inspect", "top_k"}
+            for tool in tools:
+                if retired.intersection(tool["parameters"]):
+                    raise RuntimeError(f"{name}: retired delivery controls remain: {tool}")
+                if tool["name"] != "trace_edit" and "preview_chars" not in tool["parameters"]:
+                    raise RuntimeError(f"{name}: missing inline preview control: {tool}")
             search_tool = next(tool for tool in tools if tool["name"] == "trace_search")
-            if "include_references" not in search_tool["parameters"]:
-                raise RuntimeError(f"{name}: search reference control is not model-visible")
+            if ("follow_object_links" not in search_tool["parameters"]
+                    or "include_references" in search_tool["parameters"]):
+                raise RuntimeError(f"{name}: expected follow_object_links search control")
             cooccur_tool = next(tool for tool in tools if tool["name"] == "trace_cooccur")
             if set(cooccur_tool["parameters"]) != {
-                "workspace", "seed", "against", "page_size", "max_chars", "cursor", "saved", "save_as"
+                "workspace", "seed", "against", "saved", "save_as", "preview_chars"
             }:
                 raise RuntimeError(f"{name}: cooccur arguments are not model-visible")
             classes = [item["short_class"] for item in pipeline["components"]]

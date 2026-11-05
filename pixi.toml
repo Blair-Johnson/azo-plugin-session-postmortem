@@ -7,9 +7,10 @@ platforms = ["linux-64", "osx-arm64", "osx-64"]
 [feature.dev.dependencies]
 python = ">=3.11"
 setuptools = ">=68"
+pytest = ">=9.2.0,<10"
 
 [feature.dev.tasks]
-test = "python -m unittest discover -s tests -p 'test_*.py' -v"
+test = "python -m pytest tests -q"
 cli = "python -m azo_session_postmortem"
 
 [environments]

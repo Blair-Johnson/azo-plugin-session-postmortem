@@ -1,4 +1,4 @@
-"""Check a copied existing workspace through native tools; emit counts, not source text."""
+"""Check a copied workspace through cache-native tools; emit counts, not source text."""
 import argparse
 import json
 from pathlib import Path
@@ -12,60 +12,53 @@ def map_state(db):
 
 
 def main():
-    from agent_utils import State, ToolCall
+    from agent_utils import State
     from agent_utils.files.buffer_manager import BufferManager
-    from azo_session_postmortem import native
+    from scripts.native_probe import invoke as probe_native
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("workspace", type=Path)
     args = parser.parse_args()
-    original = (args.workspace.expanduser().resolve() / "trace.sqlite3")
-    with tempfile.TemporaryDirectory(prefix="postmortem-compatibility-") as temporary:
+    original = args.workspace.expanduser().resolve() / "trace.sqlite3"
+    with tempfile.TemporaryDirectory(prefix="postmortem-cache-workspace-") as temporary:
         workspace = Path(temporary) / "study"
         workspace.mkdir()
         copied = workspace / "trace.sqlite3"
-        source = sqlite3.connect(original.as_uri() + "?mode=ro", uri=True)
-        target = sqlite3.connect(copied)
-        try:
+        with sqlite3.connect(original.as_uri() + "?mode=ro", uri=True) as source:
             before = map_state(source)
-            source.backup(target)
-        finally:
-            target.close()
-            source.close()
+            with sqlite3.connect(copied) as target:
+                source.backup(target)
         state = State()
         state.session_cwd = temporary
         state.buffer_manager = BufferManager()
         state.tool_schemas = {}
+        response_chars = buffer_chars = calls = 0
 
         def invoke(name, **arguments):
-            arguments["workspace"] = "study"
-            call = ToolCall(id="compatibility", name=name, raw_args=json.dumps(arguments), parsed_args=arguments)
-            state.pending_tool_calls = [call]
-            getattr(native, name)(state)
-            if call.error:
-                raise RuntimeError(call.result)
-            return json.loads(call.result)
+            nonlocal response_chars, buffer_chars, calls
+            response = probe_native(state, name, dict(arguments, workspace="study"),
+                                    call_id="cache-workspace")
+            calls += 1
+            response_chars += len(response.text)
+            envelope = response.require_body()
+            assert response.buffer_id.startswith("buf_")
+            view = state.buffer_manager.resolve_for_read(state, response.buffer_id)
+            assert view.text == envelope["text"]
+            with open(envelope["path"], encoding="utf-8", newline="") as saved:
+                assert saved.read() == view.text
+            buffer_chars += len(view.text)
+            return envelope["document"]
 
         opened = invoke("trace_open")
-        rows = invoke("trace_query", sql="SELECT ref FROM events ORDER BY session,seq LIMIT 1")["rows"]
-        assert rows, "Compatibility source contains no events"
-        packet = invoke("trace_read", targets=[rows[0]["ref"]], output="buffer", max_chars=400)
-        assert packet["buffer"].startswith("buf_")
-        view = state.buffer_manager.resolve_for_read(state, packet["buffer"])
-        assert view.text
-        if opened["pinned_entries"]:
-            entry = opened["pinned_entries"][0]["id"]
-            invoke("trace_read", targets=[{"entry": entry, "part": "card"}], max_chars=500)
-        db = sqlite3.connect(copied)
-        try:
-            cursor = db.execute("SELECT id FROM _cursors WHERE kind='read' ORDER BY id LIMIT 1").fetchone()
-            if cursor:
-                invoke("trace_read", cursor=f"c{cursor[0]}", max_chars=100)
-            assert before == map_state(db), "Native retrieval changed authored map state"
-        finally:
-            db.close()
-        print(json.dumps({"copied_workspace_only": True, "native_managed_buffer": True,
-                          "map_unchanged": True, "old_read_cursor_checked": bool(cursor),
-                          "counts": opened["counts"]}, sort_keys=True))
+        queried = invoke("trace_query", sql="SELECT ref FROM events ORDER BY session,seq LIMIT 1")
+        assert queried["blocks"], "Compatibility source contains no events"
+        # Read the retained row alias, rather than parsing human-facing row text.
+        invoke("trace_read", targets=[queried["blocks"][0]["id"]], preview_chars=400)
+        with sqlite3.connect(copied) as target:
+            assert before == map_state(target), "Native retrieval changed authored map state"
+        print(json.dumps({"comparison": "cache_native_workspace", "copied_workspace_only": True,
+                          "native_managed_buffer": True, "map_unchanged": True,
+                          "native_response_chars": response_chars, "buffer_chars": buffer_chars,
+                          "calls": calls, "counts": opened.get("counts", {})}, sort_keys=True))
 
 
 if __name__ == "__main__":

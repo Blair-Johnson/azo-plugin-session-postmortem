@@ -345,7 +345,7 @@ def _ref(anchor):
 
 # Catalog and structural queries.
 def trace_open(db, workspace, sessions=None, descendants=True, refresh=False,
-               page_size=8, cursor=None):
+               page_size=8, cursor=None, *, _materialize=False):
     _positive(page_size, 'page_size')
     if cursor:
         state = _uncursor(db, cursor, 'open')
@@ -359,6 +359,12 @@ def trace_open(db, workspace, sessions=None, descendants=True, refresh=False,
         if refresh:
             loaders = {r['source']: bool(r['descendants']) for r in _rows(db, 'SELECT * FROM _sources')} | loaders
         if loaders:
+            # New, disjoint sessions do not change existing evidence identities.
+            # Reloading any indexed session still invalidates conservatively,
+            # including loads performed through the legacy API.
+            cache_active = db.execute(
+                "SELECT 1 FROM sqlite_master WHERE name='_cache_state'").fetchone()
+            invalidated = False
             if __package__:
                 from .source import load_sources
             else:
@@ -366,6 +372,10 @@ def trace_open(db, workspace, sessions=None, descendants=True, refresh=False,
             for locator, descend in loaders.items():
                 for session in load_sources([locator], descendants=descend):
                     sid = session['id']
+                    if (cache_active and not invalidated and
+                            db.execute('SELECT 1 FROM sessions WHERE id=?', (sid,)).fetchone()):
+                        db.execute('UPDATE _cache_state SET generation=generation+1')
+                        invalidated = True
                     oldrefs = [r['ref'] for r in _rows(db,
                         'SELECT ref FROM events WHERE session=? UNION SELECT ref FROM objects WHERE session=?', (sid, sid))]
                     for ref in oldrefs:
@@ -417,6 +427,8 @@ def trace_open(db, workspace, sessions=None, descendants=True, refresh=False,
                             for table in ('sessions', 'events', 'objects', 'links', 'session_links', 'map_entries', 'map_links', 'saved_queries')}}
         for recipe in state['saved_queries']:
             recipe['arguments'] = json.loads(recipe['arguments'])
+    if _materialize:
+        return state
     offset = state['offset']
     keys = ('sources', 'pinned_entries', 'recent_entries', 'saved_queries')
     answer = {key: state[key][offset:offset + page_size] for key in keys}
@@ -447,7 +459,9 @@ def _sql(db, sql, params):
     def authorize(action, a, b, database, trigger):
         if action in (sqlite3.SQLITE_SELECT, sqlite3.SQLITE_RECURSIVE):
             return sqlite3.SQLITE_OK
-        if action == sqlite3.SQLITE_READ and a in PUBLIC and database == 'main':
+        if action == sqlite3.SQLITE_READ and a in PUBLIC and (
+                database == 'main' or (database is None and b == '')):
+            # SQLite reports count(*) reads with an empty column and no database.
             read_tables.add(a)
             return sqlite3.SQLITE_OK
         if action == sqlite3.SQLITE_FUNCTION and (b or '').lower() not in {
@@ -548,12 +562,13 @@ def _query_page(db, result, offset, page_size, max_chars):
         raise ValueError('not a query result')
     page, end = _display_page(rows, offset, page_size, max_chars)
     return {'result': result, 'columns': meta['columns'], 'rows': page,
-            'row_count': len(rows), 'sampling': meta['sampling'],
+            'page_offset': offset, 'row_count': len(rows), 'sampling': meta['sampling'],
+            'presentation': 'cooccur' if meta.get('_search_no_implicit_objects') else None,
             'next_cursor': _cursor(db, 'query', {'result': result, 'offset': end}) if end < len(rows) else None}
 
 
 def trace_query(db, workspace, sql=None, params=None, saved=None, sample=None,
-                page_size=20, max_chars=6000, cursor=None, save_as=None):
+                page_size=20, max_chars=6000, cursor=None, save_as=None, *, _materialize=False):
     if cursor:
         state = _uncursor(db, cursor, 'query')
         return _query_page(db, state['result'], state['offset'], page_size, max_chars)
@@ -569,7 +584,7 @@ def trace_query(db, workspace, sql=None, params=None, saved=None, sample=None,
     _save_query(db, save_as, 'query', {'sql': sql, 'params': params, 'sample': sample}, result)
     if saved:
         db.execute('UPDATE saved_queries SET last_result=? WHERE name=?', (result, saved))
-    return _query_page(db, result, 0, page_size, max_chars)
+    return result if _materialize else _query_page(db, result, 0, page_size, max_chars)
 
 
 # Source scopes and lexical retrieval.
@@ -594,8 +609,9 @@ def _scope(db, scope, on, *, search_projection=None):
         return _expand(db, anchors), set(value)
     elif key == 'refs':
         anchors = _resolve(db, value, True, search_projection=search_projection)
-    elif key == 'result':
-        anchors = _resolve(db, [{'result': value}], on != 'map',
+    elif key in ('result', 'items'):
+        targets = [{'result': value}] if key == 'result' else _list(value, 'scope.items')
+        anchors = _resolve(db, targets, on == 'source',
                            search_projection=search_projection)
         cards = [a['entry'] for a in anchors if isinstance(a, dict) and 'entry' in a]
         anchors = [a for a in anchors if not (isinstance(a, dict) and 'entry' in a)]
@@ -780,7 +796,7 @@ def _search_page(db, result, offset, page_size, max_chars):
     if kind not in ('search', 'occurrences'):
         raise ValueError('not a search result')
     page, end = _display_page(rows, offset, page_size, max_chars)
-    return {'result': result, 'hits': {
+    return {'result': result, 'page_offset': offset, 'row_count': len(rows), 'hits': {
         'source': [r for r in page if r['origin'] == 'source'],
         'map': [r for r in page if r['origin'] == 'map']},
         'matched_total': meta['matched_total'], 'selected_count': meta['selected_count'],
@@ -794,7 +810,7 @@ def _search_page(db, result, offset, page_size, max_chars):
 def trace_search(db, workspace, scope=None, query=None, mode='terms', on='source',
                  collapse='none', top_k=100, page_size=12, max_chars=6000,
                  saved=None, cursor=None, save_as=None, projection='content',
-                 include_references=True):
+                 include_references=True, *, _materialize=False):
     _projection(projection)
     if not isinstance(include_references, bool):
         raise ValueError('include_references must be a boolean')
@@ -830,7 +846,8 @@ def trace_search(db, workspace, scope=None, query=None, mode='terms', on='source
                 'SELECT ref FROM events WHERE session=? UNION SELECT ref FROM objects WHERE session=?', (sid, sid))}
             windows = {key: value for key, value in windows.items() if key[0] in allowed_refs}
             unavailable = {ref: notice for ref, notice in unavailable.items() if ref in allowed_refs}
-        coverage = {'unavailable': list(unavailable.values())[:READ_PREVIEW_LIMIT],
+        notices = list(unavailable.values())
+        coverage = {'unavailable': notices if _materialize else notices[:READ_PREVIEW_LIMIT],
                     'unavailable_count': len(unavailable),
                     'scope_summary': _scope_summary(db, windows, unavailable,
                                                     include_references, projection)}
@@ -898,7 +915,7 @@ def trace_search(db, workspace, scope=None, query=None, mode='terms', on='source
     _save_query(db, save_as, 'search', recipe, result)
     if saved:
         db.execute('UPDATE saved_queries SET last_result=? WHERE name=?', (result, saved))
-    return _search_page(db, result, 0, page_size, max_chars)
+    return result if _materialize else _search_page(db, result, 0, page_size, max_chars)
 
 
 # Bounded reading: requested slices first, then whole targets, then added context.
@@ -1014,13 +1031,14 @@ def _inspect_read(db, plan, max_chars):
             budget -= take
             block_count += 1
         card = block.get('card')
-        anchor = {'entry': block['entry_id'], 'part': 'card'} if card is not None else block['anchor']
+        is_card = card is not None or block.get('format') == 'map_card_text'
+        anchor = {'entry': block['entry_id'], 'part': 'card'} if is_card else block['anchor']
         metadata = block
         if size is None:
             metadata = (_row(db, 'SELECT kind,role,tool FROM events WHERE ref=?', (block['ref'],))
                         or _row(db, 'SELECT kind FROM objects WHERE ref=?', (block['ref'],)) or {})
         rows.append({'row': index, 'anchor': anchor, 'requested': block['requested'],
-                     'kind': 'map_card' if card is not None else metadata.get('kind'),
+                     'kind': 'map_card' if is_card else metadata.get('kind'),
                      'role': metadata.get('role'), 'tool': metadata.get('tool'),
                      'text_chars': size, 'would_deliver_chars': (take or 0) if size is not None else None,
                      'available': size is not None, '_anchors': [anchor]})
@@ -1221,8 +1239,8 @@ def trace_read(db, workspace, targets=None, before=0, after=0, pair=True,
         raise ValueError('inspect must be a boolean')
     if inspect and cursor is not None:
         raise ValueError('inspect=true cannot accompany cursor; inspection is initial-request-only')
-    if inspect and output != 'inline':
-        raise ValueError('inspect=true requires output="inline"')
+    if inspect and output not in ('inline', 'text'):
+        raise ValueError('inspect=true requires output="inline" or "text"')
     _projection(projection)
     for name, value in (('before', before), ('after', after), ('line_context', line_context)):
         _positive(value, name, zero=True)
@@ -1234,9 +1252,18 @@ def trace_read(db, workspace, targets=None, before=0, after=0, pair=True,
         if targets is None:
             raise ValueError('targets are required')
         plan = _read_plan(db, targets, before, after, pair, line_context, projection)
+        if output == 'text':
+            # Format authored cards before budgeting, so native continuations do
+            # not expose fragments of their internal JSON serialization.
+            from .render import render
+            for block in plan:
+                if 'card' in block:
+                    text = render('trace_read', {'blocks': [block]})
+                    block.pop('card')
+                    block.update(text=text, format='map_card_text', char_offset=0)
     if inspect:
         return _inspect_read(db, plan, max_chars)
-    return _read_page(db, workspace, plan, max_chars, output)
+    return _read_page(db, workspace, plan, max_chars, 'inline' if output == 'text' else output)
 
 
 # Investigator-authored map updates; the enclosing dispatch transaction is atomic.
@@ -1370,6 +1397,11 @@ def dispatch(tool, arguments):
         raise ValueError('unknown trace tool: ' + str(tool))
     if not isinstance(arguments, dict):
         raise ValueError('arguments must be an object')
+    arguments = dict(arguments)
+    if tool == 'trace_search' and 'follow_object_links' in arguments:
+        if 'include_references' in arguments:
+            raise ValueError('use follow_object_links or legacy include_references, not both')
+        arguments['include_references'] = arguments.pop('follow_object_links')
     operation, allowed = _OPERATIONS[tool]
     unknown = set(arguments) - allowed - {'workspace'}
     if unknown:

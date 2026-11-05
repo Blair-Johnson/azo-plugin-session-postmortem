@@ -1,4 +1,4 @@
-"""Native co-occurrence regression replay on a disposable copy of the prior case study.
+"""Historical engine co-occurrence compatibility replay on a disposable workspace.
 
 Known-case retrieval checks, not a fresh-agent speed/quality experiment. Output contains
 counts and reference IDs only, not private source bodies. No historical tools execute.
@@ -31,27 +31,25 @@ CASES = [
 ]
 
 
-class NativeClient:
-    """Invoke the same Tool/State wrapper as the harness without loading a model."""
+class EngineClient:
+    """Historical structured engine client; never invokes native tools.
+
+    response_chars measures serialized successful engine dictionaries only,
+    not model-visible native text or exception diagnostics.
+    """
     def __init__(self, root):
-        from agent_utils import State
-        self.state = State()
-        self.state.session_cwd, self.state.tool_schemas = str(root), {}
+        self.root = str(Path(root).resolve())
         self.calls = self.response_chars = 0
 
     def call(self, name, **arguments):
-        from agent_utils import ToolCall
-        from azo_session_postmortem import native
-        args = dict(arguments, workspace='.')
-        call = ToolCall(id=f'replay-{self.calls}', name=name,
-                        raw_args=json.dumps(args), parsed_args=args)
-        self.state.pending_tool_calls = [call]
-        getattr(native, name)(self.state)
+        from azo_session_postmortem import engine
         self.calls += 1
-        self.response_chars += len(call.result)
-        if call.error:
-            raise RuntimeError(f'{name}: {call.result}')
-        return json.loads(call.result)
+        try:
+            result = engine.dispatch(name, dict(arguments, workspace=self.root))
+        except Exception as error:
+            raise RuntimeError(str(error)) from error
+        self.response_chars += len(json.dumps(result, ensure_ascii=False))
+        return result
 
     def rows(self, first, tool):
         rows, page = [], first
@@ -98,12 +96,12 @@ def check_case(client, case):
     summary = dict(case=case['name'], seed_events=len(yes | no), matched_events=len(yes),
                    unmatched_events=len(no), positive_targets=len(case['positives']),
                    positives_kept=case['kept'], nearest_outside=nearest,
-                   calls=client.calls-calls, response_chars=client.response_chars-chars)
+                   calls=client.calls-calls, engine_response_chars=client.response_chars-chars)
     return summary, yes
 
 
 def main():
-    from azo_session_postmortem import native
+    from azo_session_postmortem import engine
     from scripts.check_workspace import map_state
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('workspace', type=Path)
@@ -117,7 +115,7 @@ def main():
             assert source.execute('SELECT count(*) FROM events').fetchone()[0] == 5842
             with sqlite3.connect(root / 'trace.sqlite3') as target:
                 source.backup(target)
-        client = NativeClient(root)
+        client = EngineClient(root)
         summaries, membership = [], {}
         for case in CASES:
             summary, refs = check_case(client, case)
@@ -127,8 +125,9 @@ def main():
         with sqlite3.connect(root / 'trace.sqlite3') as copy:
             assert before == map_state(copy)
         report = dict(status='passed', copied_workspace_only=True, map_unchanged=True,
-                      cases=summaries, native_module=native.__file__, python=sys.executable,
-                      interpretation='Known-case retrieval regression, not investigator efficacy.')
+                      cases=summaries, comparison='engine_cooccur_compatibility', response_format='engine_json',
+                       engine_module=engine.__file__, python=sys.executable,
+                      interpretation='Historical engine compatibility only; not native validation or investigator efficacy.')
         if args.output:
             args.output.parent.mkdir(parents=True, exist_ok=True)
             args.output.write_text(json.dumps(report, indent=2) + '\n', encoding='utf-8')

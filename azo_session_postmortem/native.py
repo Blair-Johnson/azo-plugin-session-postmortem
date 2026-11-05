@@ -1,15 +1,15 @@
-"""Native Agent Zoo tools; the engine remains independent of the host."""
+"""Native Agent Zoo tools; cached evidence remains independent of the host."""
 
-import json
 from pathlib import Path
 
 from agent_utils import Feature, tool
 from agent_utils.session_cwd import resolve_session_path
 
-from . import engine
+from . import cache, cache_render
 
 
 _CWD_READS = {"session_cwd", "terminal_cwd"}
+_RETRIEVAL_READS = _CWD_READS | {"buffer_manager", "step"}
 
 
 def _dispatch(name, workspace, state, **arguments):
@@ -27,168 +27,134 @@ def _dispatch(name, workspace, state, **arguments):
             sources.append(source)
         arguments["sessions"] = sources
     manager = None
-    if name == "trace_read" and arguments.get("output") == "buffer":
+    if name != "trace_edit":
         manager = getattr(state, "buffer_manager", None)
-        # Preflight before dispatch: even cursors/packet files must not be written
-        # when this host cannot deliver a real managed buffer.
+        # Preflight every retrieval before cache dispatch can create a workspace,
+        # result identity, or durable text file. Never fabricate buffer handles.
         if manager is None or not callable(getattr(manager, "create_scratch_buffer", None)):
-            raise ValueError("output=buffer requires the host BufferManager; use output=inline")
-    result = engine.dispatch(name, arguments)
-    if name == "trace_open":
-        result = {**result, "capabilities": {**result["capabilities"],
-                  "buffer_output": "managed buffer ID plus workspace packet file",
-                  "query_schema": str(Path(__file__).resolve().parents[1] / "docs" / "api.md")}}
+            raise ValueError("retrieval requires the host BufferManager")
+    result = cache.dispatch(name, arguments)
+    buffer_id = ""
     if manager is not None:
-        packet_path = result.get("buffer_path") or result["buffer"]
-        # Preserve UTF-8 and newline bytes as characters, unlike universal-newline
-        # file opening. A normal managed scratch buffer is readable by view/RLM.
-        with Path(packet_path).open("r", encoding="utf-8", newline="") as packet:
-            text = packet.read()
         buffer_id, _ = manager.create_scratch_buffer(
-            text, path=str(packet_path), turn=getattr(state, "step", 0)
+            result["text"], path=result["path"], turn=getattr(state, "step", 0)
         )
-        result = {**result, "buffer": buffer_id, "buffer_path": str(packet_path)}
-    return json.dumps(result, ensure_ascii=False)
+    return cache_render.render_preview(result["document"], buffer_id, result["preview_chars"])
 
 
-@tool(optional_reads=_CWD_READS)
+@tool(optional_reads=_RETRIEVAL_READS, writes={"buffer_manager"})
 def trace_open(
     workspace: str,
     sessions: list[str] | None = None,
     descendants: bool | None = None,
     refresh: bool | None = None,
-    page_size: int | None = None,
-    cursor: str | None = None,
+    preview_chars: int | None = None,
     state=None,
 ) -> str:
-    """Open or resume an external investigation workspace and inspect its durable map.
-
-    Omit sources to reuse the indexed view. No model calls or automatic summaries.
+    """Open or resume an investigation; cache its complete catalog in a managed buffer.
 
     Args:
         workspace: Workspace directory, relative to the agent session cwd.
         sessions: Source session IDs, locators, or JSON paths; omit to resume.
         descendants: Include descendants when opening sources (default true).
         refresh: Explicitly refresh pinned sources (default false).
-        page_size: Catalog page size (default 8).
-        cursor: Continue an open page; use only workspace and page_size with it.
+        preview_chars: Inline preview budget (default 6000); zero suppresses the preview, not the full buffer.
     """
     return _dispatch("trace_open", workspace, state, sessions=sessions,
-                     descendants=descendants, refresh=refresh, page_size=page_size, cursor=cursor)
+                     descendants=descendants, refresh=refresh, preview_chars=preview_chars)
 
 
-@tool(optional_reads=_CWD_READS)
+@tool(optional_reads=_RETRIEVAL_READS, writes={"buffer_manager"})
 def trace_query(
     workspace: str,
     sql: str | None = None,
     params: dict[str, object] | None = None,
-    saved: str | None = None,
     sample: dict[str, object] | None = None,
-    page_size: int | None = None,
-    max_chars: int | None = None,
-    cursor: str | None = None,
+    saved: str | None = None,
     save_as: str | None = None,
+    preview_chars: int | None = None,
     state=None,
 ) -> str:
-    """Select structure or map entries with read-only SQL; retain stable result selections.
+    """Run read-only SQL and cache complete rows with stable item selectors.
 
     Args:
         workspace: Workspace directory, relative to the agent session cwd.
-        sql: SELECT over sessions, events, objects, links, map_entries, map_links, map_members, result_items, or saved_queries.
-        params: Named SQL parameter values, e.g. {"role": "user"}.
-        saved: Run a saved query instead of sql, params, or sample.
+        sql: SELECT over sessions, events, objects, links, session_links, map_entries, map_links, map_members, result_items, or saved_queries.
+        params: Named SQL scalar parameter values, e.g. {"role": "user"}.
         sample: Deterministic sample object with n and optional by (column names) and seed.
-        page_size: Maximum rows per page (default 20).
-        max_chars: Display budget in characters (default 6000).
-        cursor: Continue a query page; only page_size and max_chars may accompany it.
+        saved: Run a saved query instead of sql, params, or sample.
         save_as: Save this query recipe under a caller-chosen name.
+        preview_chars: Inline preview budget (default 6000); complete values remain in the managed buffer.
     """
     return _dispatch("trace_query", workspace, state, sql=sql, params=params,
-                     saved=saved, sample=sample, page_size=page_size,
-                     max_chars=max_chars, cursor=cursor, save_as=save_as)
+                     sample=sample, saved=saved, save_as=save_as, preview_chars=preview_chars)
 
 
-@tool(optional_reads=_CWD_READS)
+@tool(optional_reads=_RETRIEVAL_READS, writes={"buffer_manager"})
 def trace_search(
     workspace: str,
-    scope: dict[str, object] | None = None,
     query: str | None = None,
+    scope: dict[str, object] | None = None,
     mode: str | None = None,
+    context_lines: int | None = None,
     on: str | None = None,
     collapse: str | None = None,
-    top_k: int | None = None,
-    page_size: int | None = None,
-    max_chars: int | None = None,
-    saved: str | None = None,
-    cursor: str | None = None,
-    save_as: str | None = None,
     projection: str | None = None,
-    include_references: bool | None = None,
+    follow_object_links: bool | None = None,
+    saved: str | None = None,
+    save_as: str | None = None,
+    preview_chars: int | None = None,
     state=None,
 ) -> str:
-    """Retrieve raw evidence and/or caller-authored map entries, keeping origins separate.
-
-    Lexical retrieval only; the investigator supplies semantic interpretation and map edits.
+    """Search exact evidence or authored map entries; cache every lexical hit.
 
     Args:
         workspace: Workspace directory, relative to the agent session cwd.
-        scope: One selector: {workspace:true}, {sessions:[IDs]}, {entries:[map IDs]}, {refs:[anchors]}, or {result:ID}.
         query: Search text or regex, according to mode.
-        mode: terms (default), literal, or regex; similar/embeddings are unsupported.
-        on: source (default), map, or both; raw and map hits remain separate.
+        scope: One selector: workspace, sessions, entries, refs, items (immutable item IDs), or result with optional cooccur group/rows.
+        mode: terms (default), literal, or regex; embeddings are unsupported.
+        context_lines: Source lines around each hit in the full buffer (default 2); aliases still select exact matching lines.
+        on: source (default), map, or both; raw and authored hits remain separate.
         collapse: none (default) or exact to group identical occurrences.
-        top_k: Reserved for unsupported similarity retrieval; lexical modes retain all matches.
-        page_size: Maximum hits per page (default 12).
-        max_chars: Display budget in characters (default 6000).
-        saved: Run a saved search instead of supplying new search selectors.
-        cursor: Continue results; only page_size and max_chars may accompany it.
-        save_as: Save the search recipe under this name.
         projection: content (default) excludes transport metadata; all includes every field.
-        include_references: Follow implicit event-to-object references (default true). False keeps event-only selections within their fields; explicitly selected objects and objects in whole workspace/session scopes remain. Omit with saved or cursor.
+        follow_object_links: Follow implicit event-to-object references (default true). False keeps event-only selections within their fields; explicit objects remain. Omit with saved.
+        saved: Run a saved search instead of supplying new search selectors.
+        save_as: Save the search recipe under this name.
+        preview_chars: Inline preview budget (default 6000); all hits remain in the managed buffer.
     """
-    return _dispatch("trace_search", workspace, state, scope=scope, query=query,
-                     mode=mode, on=on, collapse=collapse, top_k=top_k,
-                     page_size=page_size, max_chars=max_chars, saved=saved,
-                     cursor=cursor, save_as=save_as, projection=projection,
-                     include_references=include_references)
+    return _dispatch("trace_search", workspace, state, query=query, scope=scope,
+                     mode=mode, context_lines=context_lines, on=on, collapse=collapse,
+                     projection=projection, follow_object_links=follow_object_links,
+                     saved=saved, save_as=save_as, preview_chars=preview_chars)
 
 
-@tool(optional_reads=_CWD_READS | {"buffer_manager", "step"}, writes={"buffer_manager"})
+@tool(optional_reads=_RETRIEVAL_READS, writes={"buffer_manager"})
 def trace_read(
     workspace: str,
-    targets: list[str | dict[str, object]] | None = None,
+    targets: list[str | dict[str, object]],
     before: int | None = None,
     after: int | None = None,
     pair: bool | None = None,
     line_context: int | None = None,
-    max_chars: int | None = None,
-    output: str | None = None,
-    cursor: str | None = None,
     projection: str | None = None,
-    inspect: bool | None = None,
+    preview_chars: int | None = None,
     state=None,
 ) -> str:
-    """Read exact anchored evidence or map cards, or inspect their delivery costs.
-
-    Buffer output returns a real managed buffer ID plus the engine's packet path.
+    """Read exact evidence or map cards into a complete indexed managed buffer.
 
     Args:
         workspace: Workspace directory, relative to the agent session cwd.
-        targets: Whole refs, whole fields {event:ref,field:text}, whole objects {object:ref}, or slices with lines:[lo,hi]. Also {session:ID,events:[lo,hi]}, {entry:ID,part:card|anchors}, or {result:ID,rows:[0,1]}. Lines/events are inclusive 1-based; result rows are 0-based. Omit or use null with cursor.
-        before: Preceding event count (default 0); omit or use null with cursor.
-        after: Following event count (default 0); omit or use null with cursor.
-        pair: Include paired tool calls/results (default true); omit or use null with cursor.
-        line_context: Extra lines around line anchors (default 10); omit or use null with cursor.
-        max_chars: Content-text character budget, excluding headers (default 12000).
-        output: inline (default), compact (same evidence, reduced metadata), or buffer (requires the host BufferManager). Choose per page; compact omits redundant delivered/default block fields, not references.
-        cursor: Continue an immutable read snapshot using workspace, cursor and optional max_chars/output. Selection/expansion arguments must be null or omitted, even default-valued flags. inspect=false is inert and also accepted.
-        projection: content (default) or all; explicit field anchors remain exact. Omit or use null with cursor.
-        inspect: Predict this read's delivery costs without source bodies (default false). Initial request and inline output only; omit or use null with cursor. Page returned plan_cursor with trace_query; read selected plan_result rows normally.
+        targets: Source refs or immutable item IDs; whole event fields, objects, line slices, session event ranges, map cards/anchors, or result selections with optional group/rows. Lines/events are inclusive 1-based; rows are 0-based.
+        before: Preceding event count (default 0).
+        after: Following event count (default 0).
+        pair: Include paired tool calls/results (default true).
+        line_context: Extra lines around line anchors (default 10).
+        projection: content (default) or all; explicit field anchors remain exact.
+        preview_chars: Inline preview budget (default 12000); zero suppresses the preview, never the complete buffer.
     """
     return _dispatch("trace_read", workspace, state, targets=targets, before=before,
                      after=after, pair=pair, line_context=line_context,
-                     max_chars=max_chars, output=output, cursor=cursor,
-                     projection=projection, inspect=inspect)
+                     projection=projection, preview_chars=preview_chars)
 
 
 @tool(optional_reads=_CWD_READS)
@@ -200,13 +166,11 @@ def trace_edit(
     unlink: list[str] | None = None,
     state=None,
 ) -> str:
-    """Atomically update the investigator-authored durable map, never the transcript.
-
-    Maintain semantic episodes, evidence anchors, relations and pinned continuation notes.
+    """Atomically update the authored map, resolving item aliases to exact source anchors.
 
     Args:
         workspace: Workspace directory, relative to the agent session cwd.
-        put: Entry patches; new entries require id, kind (episode/note), title. Omitted fields stay unchanged; null clears note, tags, fields, pinned, details_path. Episodes require anchors. Use anchors OR add_anchors/remove_anchors, not both.
+        put: Entry patches; new entries require id, kind (episode/note), title. Omitted fields stay unchanged; null clears note, tags, fields, pinned, details_path. Episodes require anchors (source addresses or item IDs). Use anchors OR add_anchors/remove_anchors, not both.
         delete: Map entry IDs to delete.
         link: Relation objects with id, from, to, label and optional note.
         unlink: Relation IDs to remove.
@@ -215,35 +179,28 @@ def trace_edit(
                      link=link, unlink=unlink)
 
 
-@tool(optional_reads=_CWD_READS)
+@tool(optional_reads=_RETRIEVAL_READS, writes={"buffer_manager"})
 def trace_cooccur(
     workspace: str,
     seed: dict[str, object] | None = None,
     against: list[dict[str, object]] | None = None,
-    page_size: int | None = None,
-    max_chars: int | None = None,
-    cursor: str | None = None,
     saved: str | None = None,
     save_as: str | None = None,
+    preview_chars: int | None = None,
     state=None,
 ) -> str:
-    """Join retained event selections by bounded same-session sequence windows.
-
-    No semantic judgment or source bodies. Read seed and witness results separately.
+    """Join retained event selections; cache all matched/unmatched seeds and witnesses.
 
     Args:
         workspace: Workspace directory, relative to the agent session cwd.
-        seed: Retained result selector {result:ID} or {result:ID,rows:[zero-based indexes]}; omitted rows select all, [] selects none.
-        against: One to three conditions, each with unique name (not seed), selection (result selector), and nonnegative integer before/after windows. All keys required; nested nulls invalid.
-        page_size: Maximum matched seed rows per page (default 10).
-        max_chars: Visible row JSON budget (default 6000); navigation may exceed tiny budgets.
-        cursor: Continue matched rows only; only workspace, page_size and max_chars may accompany it. Page unmatched_cursor with trace_query.
-        saved: Rerun a saved cooccur recipe against its fixed input results; cannot accompany seed/against.
-        save_as: Save selectors and windows, not a fresh underlying search recipe.
+        seed: {items:[IDs]} or {result:ID} with optional group (matched/unmatched/witnesses) and rows. Omitted rows select all; [] selects none.
+        against: One to three named conditions with selection (same shape as seed), nonnegative before/after event windows; nested nulls invalid.
+        saved: Rerun a saved cooccur recipe against its fixed input selections; cannot accompany seed/against.
+        save_as: Save selectors and windows as a reusable recipe.
+        preview_chars: Inline preview budget (default 6000); full relations and witness links remain in the managed buffer.
     """
     return _dispatch("trace_cooccur", workspace, state, seed=seed, against=against,
-                     page_size=page_size, max_chars=max_chars, cursor=cursor,
-                     saved=saved, save_as=save_as)
+                     saved=saved, save_as=save_as, preview_chars=preview_chars)
 
 
 # The host decorator cannot infer dictionaries or mixed unions. Bare objects also
@@ -270,13 +227,25 @@ def _nullable(schema):
 _STRING = {"type": "string"}
 _STRINGS = _array(_STRING)
 _RANGE = _array({"type": "integer", "minimum": 1}, minItems=2, maxItems=2)
+# Closed, fully required alternatives survive strict provider conversion.
+_ROWS = _array({"type": "integer", "minimum": 0})
+_RESULT_ID = {"type": "string", "minLength": 1}
+_GROUP = {"type": "string", "enum": ["matched", "unmatched", "witnesses"]}
+_RESULT_VARIANTS = [
+    _object({"result": _RESULT_ID}, ["result"]),
+    _object({"result": _RESULT_ID, "rows": _ROWS}, ["result", "rows"]),
+    _object({"result": _RESULT_ID, "group": _GROUP}, ["result", "group"]),
+    _object({"result": _RESULT_ID, "group": _GROUP, "rows": _ROWS},
+            ["result", "group", "rows"]),
+]
+_ITEMS = _object({"items": _array(_RESULT_ID)}, ["items"])
+_RESULT_SELECTION = {"anyOf": [*_RESULT_VARIANTS, _ITEMS]}
 _ADDRESS_VARIANTS = [
     _STRING,
     _object({"event": _STRING, "field": _STRING, "lines": _RANGE}, ["event"]),
     _object({"object": _STRING, "lines": _RANGE}, ["object"]),
     _object({"session": _STRING, "events": _RANGE}, ["session", "events"]),
-    _object({"result": _STRING, "rows": _array({"type": "integer", "minimum": 0})},
-            ["result"]),
+    *_RESULT_VARIANTS,
     # Separate whole-content branches survive providers requiring every property.
     # Keep the richer variants above for slices and existing optional defaults.
     _object({"event": _STRING, "field": _STRING}, ["event", "field"]),
@@ -331,17 +300,11 @@ _SCOPE = {"anyOf": [
     _object({"sessions": _STRINGS}, ["sessions"]),
     _object({"entries": _STRINGS}, ["entries"]),
     _object({"refs": _ANCHORS}, ["refs"]),
-    _object({"result": _STRING}, ["result"]),
+    *_RESULT_VARIANTS,
+    _ITEMS,
 ]}
 
 
-# Both branches require every property, including under strict provider conversion.
-# Omitted rows must not turn into a required nullable rows property.
-_RESULT_SELECTION = {"anyOf": [
-    _object({"result": {"type": "string", "minLength": 1}}, ["result"]),
-    _object({"result": {"type": "string", "minLength": 1},
-             "rows": _array({"type": "integer", "minimum": 0})}, ["result", "rows"]),
-]}
 _COOCCUR_CONDITION = _object({
     "name": {"type": "string", "minLength": 1,
              "description": "Unique condition name; seed is reserved."},
@@ -358,7 +321,6 @@ for _component, _name, _schema in (
     (trace_search, "scope", _SCOPE),
     (trace_edit, "put", _array(_PATCH)),
     (trace_edit, "link", _array(_RELATION)),
-    (trace_read, "targets", _array(_READ_TARGET)),
 ):
     _structured_parameter(_component, _name, _nullable(_schema))
 for _component, _name, _values in (
@@ -367,10 +329,16 @@ for _component, _name, _values in (
     (trace_search, "collapse", ["none", "exact"]),
     (trace_search, "projection", ["content", "all"]),
     (trace_read, "projection", ["content", "all"]),
-    (trace_read, "output", ["inline", "compact", "buffer"]),
 ):
     _structured_parameter(_component, _name,
                           _nullable({"type": "string", "enum": _values}))
+
+_structured_parameter(trace_read, "targets", _array(_READ_TARGET))
+for _component in (trace_open, trace_query, trace_search, trace_read, trace_cooccur):
+    _structured_parameter(_component, "preview_chars",
+                          _nullable({"type": "integer", "minimum": 0}))
+_structured_parameter(trace_search, "context_lines",
+                      _nullable({"type": "integer", "minimum": 0}))
 
 TOOLS = (trace_open, trace_query, trace_search, trace_read, trace_edit, trace_cooccur)
 
