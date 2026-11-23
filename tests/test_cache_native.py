@@ -9,8 +9,9 @@ from unittest.mock import patch
 
 HOST = importlib.util.find_spec("agent_utils") is not None
 if HOST:
-    from agent_utils import State, ToolCall
-    from agent_utils.files.buffer_manager import BufferManager
+    from agent_utils.core.events import RunToolCall, ToolCallFinished
+    from agent_utils.core.state import State, ToolCall
+    from agent_utils.features.buffers.manager import BufferManager
     from azo_session_postmortem import native
 
 
@@ -20,8 +21,7 @@ class CacheNativeTests(unittest.TestCase):
         temp = tempfile.TemporaryDirectory()
         self.addCleanup(temp.cleanup)
         self.root = Path(temp.name).resolve()
-        self.state = State()
-        self.state.session_cwd = str(self.root)
+        self.state = State(cwd=str(self.root))
         self.state.tool_schemas = {}
         self.state.buffer_manager = BufferManager()
         self.state.step = 17
@@ -30,7 +30,10 @@ class CacheNativeTests(unittest.TestCase):
         args = {"workspace": "study", **arguments}
         call = ToolCall(id="cache-native", name=name, raw_args=json.dumps(args), parsed_args=args)
         self.state.pending_tool_calls = [call]
-        self.assertIs(getattr(native, name)(self.state), self.state)
+        emitted = []
+        getattr(native, name).handle(RunToolCall(call), self.state, emitted.append)
+        self.assertEqual(len(emitted), 1)
+        self.assertIsInstance(emitted[0], ToolCallFinished)
         self.assertEqual(call.error, error, call.result)
         return call.result
 

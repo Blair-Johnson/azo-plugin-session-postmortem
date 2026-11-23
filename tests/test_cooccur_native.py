@@ -14,8 +14,8 @@ from unittest.mock import patch
 HOST_AVAILABLE = importlib.util.find_spec("agent_utils") is not None
 ZOO_AVAILABLE = importlib.util.find_spec("agent_zoo") is not None
 if HOST_AVAILABLE:
-    from agent_utils import State, ToolCall
-    from agent_utils.files.buffer_manager import BufferManager
+    from agent_utils.core.state import State, ToolCall
+    from agent_utils.features.buffers.manager import BufferManager
     import test_native as native_fixtures
     from azo_session_postmortem import native
 
@@ -40,8 +40,7 @@ class SyntheticFixture:
 class CooccurNativeTests(SyntheticFixture, unittest.TestCase):
     def setUp(self):
         super().setUp()
-        self.state = State()
-        self.state.session_cwd = str(self.root)
+        self.state = State(cwd=str(self.root))
         self.state.tool_schemas = {}
         self.state.buffer_manager = BufferManager()
 
@@ -193,7 +192,8 @@ class CooccurNativeTests(SyntheticFixture, unittest.TestCase):
 
     @unittest.skipUnless(ZOO_AVAILABLE, "provider conversion requires Agent Zoo")
     def test_host_provider_conversion_retains_nonnull_nested_schemas(self):
-        from agents.llm import _scrub_fn_tool_schemas, _tools_for_responses
+        from agent_zoo.llm.providers.common import _scrub_fn_tool_schemas
+        from agent_zoo.llm.providers.openai_responses import _tools_for_responses
         original = copy.deepcopy(native.trace_cooccur.schema)
         converted = _tools_for_responses(_scrub_fn_tool_schemas([original]))[0]
         self.assertEqual(converted["parameters"], native.trace_cooccur.schema["function"]["parameters"])

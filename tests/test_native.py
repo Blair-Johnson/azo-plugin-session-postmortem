@@ -16,8 +16,10 @@ from unittest.mock import patch
 HOST_AVAILABLE = importlib.util.find_spec("agent_utils") is not None
 ZOO_AVAILABLE = importlib.util.find_spec("agent_zoo") is not None
 if HOST_AVAILABLE:
-    from agent_utils import State, ToolCall
-    from agent_utils.files.buffer_manager import BufferManager
+    from agent_utils.core.events import RenderRequested, RunToolCall, ToolCallFinished
+    from agent_utils.core.session import Session
+    from agent_utils.core.state import State, ToolCall
+    from agent_utils.features.buffers.manager import BufferManager
     from azo_session_postmortem import native
 
 
@@ -27,8 +29,7 @@ class NativeTests(unittest.TestCase):
         self.temp = tempfile.TemporaryDirectory()
         self.addCleanup(self.temp.cleanup)
         self.root = Path(self.temp.name).resolve()
-        self.state = State()
-        self.state.session_cwd = str(self.root)
+        self.state = State(cwd=str(self.root))
         self.state.tool_schemas = {}
         self.state.buffer_manager = BufferManager()
         self.source = self.root / "session.json"
@@ -48,11 +49,14 @@ class NativeTests(unittest.TestCase):
         call = ToolCall(id="native-test", name=name, raw_args=json.dumps(arguments), parsed_args=arguments)
         self.state.pending_tool_calls = [call]
         component = getattr(native, name)
+        emitted = []
         with patch.object(native.cache_render, "render_preview", wraps=native.cache_render.render_preview) as rendered:
-            self.assertIs(component(self.state), self.state)
+            component.handle(RunToolCall(call), self.state, emitted.append)
+        self.assertEqual(len(emitted), 1)
+        self.assertIsInstance(emitted[0], ToolCallFinished)
+        self.assertIs(emitted[0].tool_call, call)
         self.assertIsNotNone(call.result)
         self.assertEqual(call.error, expect_error, call.result)
-        self.assertIn(name, self.state.tool_schemas)
         if expect_error:
             return call.result
         self.last_preview = call.result
@@ -70,6 +74,9 @@ class NativeTests(unittest.TestCase):
 
     @unittest.skipUnless(ZOO_AVAILABLE, "feature registration requires the Agent Zoo host")
     def test_native_schema_publication_and_registration(self):
+        from agent_zoo.pipelines.default import build_default_builder
+        from agent_zoo.pipelines.rlm import build_default_rlm_builder, build_readonly_rlm_builder
+
         features = []
         class Builder:
             def add(self, feature):
@@ -79,18 +86,26 @@ class NativeTests(unittest.TestCase):
         self.assertEqual(features[0].name, "session_postmortem")
         self.assertIsInstance(features[0].components[0], native.SessionPostmortemSkill)
         self.assertEqual(list(native.TOOLS), features[0].components[1:])
-        self.state.pending_tool_calls = []
-        for component in native.TOOLS:
-            component(self.state)
-            published = self.state.tool_schemas[component.name]
-            self.assertTrue(published["available"])
-            parameters = published["schema"]["function"]["parameters"]
-            self.assertEqual(parameters["required"], ["workspace", "targets"] if component.name == "trace_read" else ["workspace"])
-            self.assertNotIn("state", parameters["properties"])
-            self.assertNotIn("arguments", parameters["properties"])
-            self.assertTrue(all(p.get("description") for p in parameters["properties"].values()))
-            self.assertTrue({"session_cwd", "terminal_cwd"} <= component.optional_reads)
-        self.assertEqual(set(self.state.tool_schemas), {"trace_open", "trace_query", "trace_search", "trace_read", "trace_edit", "trace_cooccur"})
+
+        # Compose onto real host builders and verify schema + skill publication.
+        for make_builder in (build_default_builder, build_default_rlm_builder, build_readonly_rlm_builder):
+            session = Session(state=State(cwd=str(self.root)))
+            builder = make_builder(session, config={}, include_plugins=False, include_llm_drivers=False)
+            native.register_features(builder, session=session, config={})
+            pipeline = builder.build()
+            pipeline.init_state(session.state)
+            pipeline.step(session.state, RenderRequested())
+            for component in native.TOOLS:
+                published = session.state.tool_schemas[component.name]
+                self.assertTrue(published["available"])
+                parameters = published["schema"]["function"]["parameters"]
+                self.assertEqual(parameters["required"], ["workspace", "targets"] if component.name == "trace_read" else ["workspace"])
+                self.assertNotIn("state", parameters["properties"])
+                self.assertNotIn("arguments", parameters["properties"])
+                self.assertTrue(all(p.get("description") for p in parameters["properties"].values()))
+                self.assertTrue({"cwd", "session_cwd", "terminal_cwd"} <= component.optional_reads)
+            self.assertIsNotNone(session.state.skill_registry.resolve("session-postmortem")[0])
+
         props = native.trace_query.schema["function"]["parameters"]["properties"]
         self.assertEqual(props["params"]["anyOf"][0]["type"], "object")
         self.assertEqual(set(props["sample"]["anyOf"][0]["properties"]), {"n", "by", "seed"})
@@ -129,7 +144,7 @@ class NativeTests(unittest.TestCase):
         self.assertTrue(any("S" in b["text"] for b in opened["blocks"]))
 
     def test_legacy_terminal_cwd_is_supported(self):
-        del self.state.session_cwd
+        self.state.cwd = ""
         self.state.terminal_cwd = str(self.root)
         self.assertEqual(self.open_source()["workspace"], str(self.root / "study"))
 
@@ -190,15 +205,15 @@ class NativeTests(unittest.TestCase):
             self.assertIn(key, error)
 
     def test_bundled_skill_registration_and_activation(self):
-        from agent_utils.skills import SkillRegistry
+        from agent_utils.features.skills import SkillRegistry
 
         component = native.SessionPostmortemSkill()
-        self.assertIs(component(self.state), self.state)
-        registry = SkillRegistry(paths=[])
+        component.handle(RenderRequested(), self.state, lambda _ev: None)
+        registry = SkillRegistry()
         self.state.skill_registry = registry
         with patch.object(registry, "add_sources", wraps=registry.add_sources) as add:
-            self.assertIs(component(self.state), self.state)
-            component(self.state)
+            component.handle(RenderRequested(), self.state, lambda _ev: None)
+            component.handle(RenderRequested(), self.state, lambda _ev: None)
             self.assertEqual(add.call_count, 1)
         skill, _ = registry.resolve("session-postmortem")
         self.assertIsNotNone(skill)
@@ -207,9 +222,9 @@ class NativeTests(unittest.TestCase):
         activated = registry.format_activation(skill)
         self.assertIn("trace_read", activated)
         self.assertIn("trace_search", activated)
-        replacement = SkillRegistry(paths=[])
+        replacement = SkillRegistry()
         self.state.skill_registry = replacement
-        component(self.state)
+        component.handle(RenderRequested(), self.state, lambda _ev: None)
         self.assertIsNotNone(replacement.resolve("session-postmortem")[0])
 
     def test_small_previews_keep_full_independent_managed_buffers(self):
@@ -291,9 +306,9 @@ class NativeTests(unittest.TestCase):
                            params={"entry": "a"})["blocks"][0]
         self.assertEqual(card["text"], "fields: {}")
     @unittest.skipUnless(ZOO_AVAILABLE, "agent_zoo is not installed; fresh host-loader test requires it")
-    @unittest.skipUnless(ZOO_AVAILABLE, "agent_zoo is not installed; loader test needs the full host")
     def test_fresh_host_loader_with_symlink_and_unrelated_cwd(self):
-        shim = Path(__file__).resolve().parents[1] / "src" / "session_postmortem.py"
+        repo_root = Path(__file__).resolve().parents[1]
+        shim = repo_root / "src" / "session_postmortem.py"
         common = self.root / "plugins" / "common"
         common.mkdir(parents=True)
         installed = common / "session_postmortem.py"
@@ -305,29 +320,38 @@ class NativeTests(unittest.TestCase):
             import json
             from pathlib import Path
             import sys
-            from agent_utils import State
-            from agent_zoo.plugins import _apply_file_plugin
+            from agent_utils.core.events import RenderRequested
+            from agent_utils.core.session import Session
+            from agent_utils.core.state import State
+            from agent_zoo.pipelines.default import build_default_builder
+            from agent_zoo.pipelines.rlm import build_default_rlm_builder
+            from agent_zoo.plugins.loader import _apply_file_plugin
             before = list(sys.path)
-            class Builder:
-                def __init__(self): self.features = []
-                def add(self, feature): self.features.append(feature)
-            for scope in ("default", "rlm"):
-                builder = Builder()
-                _apply_file_plugin(Path(sys.argv[1]), builder=builder, session=None, config={})
-                assert len(builder.features) == 1, (scope, builder.features)
-                state = State()
-                state.tool_schemas = {}
-                for component in builder.features[0].components:
-                    component(state)
-                assert len(state.tool_schemas) == 6
-                assert all(p["available"] for p in state.tool_schemas.values())
+            expected = {"trace_open", "trace_query", "trace_search", "trace_read", "trace_edit", "trace_cooccur"}
+            for scope, make_builder in (("default", build_default_builder), ("rlm", build_default_rlm_builder)):
+                session = Session(state=State())
+                builder = make_builder(session, config={}, include_plugins=False, include_llm_drivers=False)
+                _apply_file_plugin(Path(sys.argv[1]), builder=builder, session=session, config={})
+                assert builder.has("session_postmortem"), scope
+                pipeline = builder.build()
+                pipeline.init_state(session.state)
+                pipeline.step(session.state, RenderRequested())
+                found = {name: session.state.tool_schemas[name] for name in expected}
+                assert all(p["available"] for p in found.values()), (scope, found)
             assert sys.path == before
             assert "azo_session_postmortem" not in sys.modules
-            print(json.dumps(sorted(state.tool_schemas)))
+            print(json.dumps(sorted(expected)))
         ''')
+        env = dict(os.environ)
+        if env.get("PYTHONPATH"):
+            parts = [
+                p for p in env["PYTHONPATH"].split(os.pathsep)
+                if p and Path(p).resolve() != repo_root
+            ]
+            env["PYTHONPATH"] = os.pathsep.join(parts)
         completed = subprocess.run(
-            [sys.executable, "-I", "-B", "-c", script, str(installed)],
-            cwd=self.root, text=True, capture_output=True, timeout=30,
+            [sys.executable, "-P", "-B", "-c", script, str(installed)],
+            cwd=self.root, env=env, text=True, capture_output=True, timeout=30,
         )
         self.assertEqual(completed.returncode, 0, completed.stdout + completed.stderr)
         self.assertEqual(json.loads(completed.stdout), sorted(component.name for component in native.TOOLS))
@@ -414,12 +438,10 @@ class NativeSchemaTests(unittest.TestCase):
 
     @unittest.skipUnless(ZOO_AVAILABLE, "provider conversion requires the Agent Zoo host")
     def test_actual_host_provider_conversion_preserves_nested_schemas(self):
-        from agents.llm import _scrub_fn_tool_schemas, _tools_for_responses
-        state = State()
-        state.tool_schemas = {}
-        for component in native.TOOLS:
-            component(state)
-        published = [value["schema"] for value in state.tool_schemas.values()]
+        from agent_zoo.llm.providers.common import _scrub_fn_tool_schemas
+        from agent_zoo.llm.providers.openai_responses import _tools_for_responses
+
+        published = [component.schema for component in native.TOOLS]
         before = json.dumps(published, sort_keys=True)
         converted = _tools_for_responses(_scrub_fn_tool_schemas(published))
         self.assertEqual(len(converted), 6)

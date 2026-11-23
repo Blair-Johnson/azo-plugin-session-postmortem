@@ -9,8 +9,9 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 
 def main():
-    from agent_utils import State, ToolCall
-    from agent_utils.files.buffer_manager import BufferManager
+    from agent_utils.core.events import RunToolCall
+    from agent_utils.core.state import State, ToolCall
+    from agent_utils.features.buffers.manager import BufferManager
     from azo_session_postmortem import native
 
     with tempfile.TemporaryDirectory(prefix='postmortem-cache-workflow-') as temp:
@@ -25,8 +26,8 @@ def main():
                 for i, body in enumerate(bodies)],
             'trace_objects': [{'ref': 'S/o-log', 'session': 'S', 'kind': 'buffer',
                 'available': True, 'text': '\n'.join(f'log line {i}' for i in range(40000))}]}))
-        state = State()
-        state.session_cwd, state.tool_schemas = str(root), {}
+        state = State(cwd=str(root))
+        state.tool_schemas = {}
         state.buffer_manager = BufferManager()
         calls = chars = 0
 
@@ -36,7 +37,7 @@ def main():
             pending = ToolCall(id=f'cache-smoke-{calls}', name=name,
                                raw_args=json.dumps(args), parsed_args=args)
             state.pending_tool_calls = [pending]
-            getattr(native, name)(state)
+            getattr(native, name).handle(RunToolCall(pending), state, lambda _ev: None)
             assert not pending.error, pending.result
             calls += 1
             chars += len(pending.result)

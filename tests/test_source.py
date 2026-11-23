@@ -92,13 +92,13 @@ class SourceTests(unittest.TestCase):
         (path.parent / "journals").mkdir()
         from types import SimpleNamespace
         try:
-            import agent_zoo.session_load
+            import agent_zoo.storage.load
         except ImportError:
             self.skipTest("managed-session reader requires the optional agent_zoo host")
         loaded = SimpleNamespace(state=SimpleNamespace(document={"id": "sid", "entries": []},
             commit_id="commit", instance_id="instance", source_format="journal"),
             freshness="reconciled-observation", warning=None)
-        with patch("agent_zoo.session_load.load_session", return_value=loaded) as loader:
+        with patch("agent_zoo.storage.load.load_session", return_value=loaded) as loader:
             session, = source.load_sources([str(path)], descendants=False)
         self.assertEqual(session["id"], "sid")
         self.assertTrue(loader.call_args.kwargs["reconcile_shared"])
@@ -116,7 +116,7 @@ class SourceTests(unittest.TestCase):
             ({"HOME": str(self.root)}, self.root / ".local/share/agent-zoo"),
         ]
         for env, expected in cases:
-            with self.subTest(env=env), patch.dict(os.environ, env, clear=True), patch.dict(sys.modules, {"agent_zoo.projects": None}):
+            with self.subTest(env=env), patch.dict(os.environ, env, clear=True), patch.dict(sys.modules, {"agent_zoo.storage.projects": None}):
                 self.assertEqual(source._root(), expected.resolve() / "projects")
                 self.assertFalse(expected.exists())
 if __name__ == "__main__":

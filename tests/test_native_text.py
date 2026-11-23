@@ -9,8 +9,9 @@ from unittest.mock import patch
 
 HOST_AVAILABLE = importlib.util.find_spec("agent_utils") is not None
 if HOST_AVAILABLE:
-    from agent_utils import State, ToolCall
-    from agent_utils.files.buffer_manager import BufferManager
+    from agent_utils.core.events import RunToolCall, ToolCallFinished
+    from agent_utils.core.state import State, ToolCall
+    from agent_utils.features.buffers.manager import BufferManager
     from azo_session_postmortem import native
 
 
@@ -20,8 +21,7 @@ class NativeTextTests(unittest.TestCase):
         temp = tempfile.TemporaryDirectory()
         self.addCleanup(temp.cleanup)
         self.root = Path(temp.name).resolve()
-        self.state = State()
-        self.state.session_cwd = str(self.root)
+        self.state = State(cwd=str(self.root))
         self.state.tool_schemas = {}
         self.state.buffer_manager = BufferManager()
         self.bodies = ["candidate one — naïve\r\n  exact tail  \n", "receipt alpha",
@@ -37,8 +37,11 @@ class NativeTextTests(unittest.TestCase):
         arguments = {"workspace": "study", **arguments}
         call = ToolCall(id="native-text", name=name, raw_args=json.dumps(arguments), parsed_args=arguments)
         self.state.pending_tool_calls = [call]
+        emitted = []
         with patch.object(native.cache_render, "render_preview", wraps=native.cache_render.render_preview) as render:
-            self.assertIs(getattr(native, name)(self.state), self.state)
+            getattr(native, name).handle(RunToolCall(call), self.state, emitted.append)
+        self.assertEqual(len(emitted), 1)
+        self.assertIsInstance(emitted[0], ToolCallFinished)
         self.assertEqual(call.error, error, call.result)
         self.assertIsInstance(call.result, str)
         if not error:

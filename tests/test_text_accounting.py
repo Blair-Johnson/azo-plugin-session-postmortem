@@ -180,8 +180,8 @@ class EngineCompatibilityTests(unittest.TestCase):
 @unittest.skipUnless(importlib.util.find_spec('agent_utils'), 'requires Agent Zoo host')
 class NativeProbeTests(unittest.TestCase):
     def setUp(self):
-        from agent_utils import State
-        from agent_utils.files.buffer_manager import BufferManager
+        from agent_utils.core.state import State
+        from agent_utils.features.buffers.manager import BufferManager
         temporary = tempfile.TemporaryDirectory()
         self.addCleanup(temporary.cleanup)
         self.root = Path(temporary.name)
@@ -190,8 +190,8 @@ class NativeProbeTests(unittest.TestCase):
         self.source.write_text(json.dumps({'format_version': 2, 'meta': {'session_id': 'S'},
             'entries': [{'index': 0, 'step': 0, 'messages': [
                 {'role': 'user', 'content': self.source_text}]}]}))
-        self.state = State()
-        self.state.session_cwd, self.state.tool_schemas = temporary.name, {}
+        self.state = State(cwd=temporary.name)
+        self.state.tool_schemas = {}
         self.state.buffer_manager = BufferManager()
 
     def invoke(self, name, **arguments):
@@ -276,11 +276,11 @@ class NativeProbeTests(unittest.TestCase):
         self.assertIs(native.cache_render.render_preview, original_preview)
 
     def test_retrieval_requires_manager_but_edit_does_not(self):
-        from agent_utils import State
+        from agent_utils.core.state import State
         from scripts.native_probe import invoke
         self.invoke('trace_open', sessions=[str(self.source)]).require_body()
-        state = State()
-        state.session_cwd, state.tool_schemas = str(self.root), {}
+        state = State(cwd=str(self.root))
+        state.tool_schemas = {}
         failure = invoke(state, 'trace_open', dict(workspace='absent'))
         self.assertTrue(failure.error)
         self.assertFalse((self.root / 'absent').exists())

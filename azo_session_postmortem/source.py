@@ -60,7 +60,7 @@ def _read_json(path):
 def _root():
     # Import lazily: portable fixtures work with stdlib alone.
     try:
-        from agent_zoo.projects import resolve_state_root
+        from agent_zoo.storage.projects import resolve_state_root
         return resolve_state_root(create=False) / "projects"
     except ImportError:
         home = os.environ.get("AGENT_ZOO_HOME") or os.environ.get("AGENT_ZOO_STATE_ROOT")
@@ -119,7 +119,7 @@ def _load(path):
             raise SourceError(f"Session JSON must be an object: {path}")
         return doc, [], {}
     try:
-        from agent_zoo.session_load import load_session
+        from agent_zoo.storage.load import load_session
         loaded = load_session(path, session_id=path.parent.name, reconcile_shared=True)
         state = loaded.state
         provenance = dict(commit_id=state.commit_id, instance_id=state.instance_id,

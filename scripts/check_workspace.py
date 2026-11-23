@@ -12,8 +12,8 @@ def map_state(db):
 
 
 def main():
-    from agent_utils import State
-    from agent_utils.files.buffer_manager import BufferManager
+    from agent_utils.core.state import State
+    from agent_utils.features.buffers.manager import BufferManager
     from scripts.native_probe import invoke as probe_native
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("workspace", type=Path)
@@ -27,8 +27,7 @@ def main():
             before = map_state(source)
             with sqlite3.connect(copied) as target:
                 source.backup(target)
-        state = State()
-        state.session_cwd = temporary
+        state = State(cwd=temporary)
         state.buffer_manager = BufferManager()
         state.tool_schemas = {}
         response_chars = buffer_chars = calls = 0

@@ -31,13 +31,15 @@ class NativeResponse:
 
 def invoke(state, name, arguments, *, call_id="native-probe"):
     """Observe the real cache envelope and preview inputs; preserve ToolCall.result."""
-    from agent_utils import ToolCall
+    from agent_utils.core.events import RunToolCall
+    from agent_utils.core.state import ToolCall
     from azo_session_postmortem import native
 
     call = ToolCall(id=call_id, name=name, raw_args=json.dumps(arguments),
                     parsed_args=arguments)
     state.pending_tool_calls = [call]
     envelopes = []
+    emitted = []
     dispatch = native.cache.dispatch
 
     def observe_dispatch(*args, **kwargs):
@@ -48,7 +50,7 @@ def invoke(state, name, arguments, *, call_id="native-probe"):
     with patch.object(native.cache, "dispatch", side_effect=observe_dispatch), \
             patch.object(native.cache_render, "render_preview",
                          wraps=native.cache_render.render_preview) as observed:
-        getattr(native, name)(state)
+        getattr(native, name).handle(RunToolCall(call), state, emitted.append)
     assert isinstance(call.result, str), "Native responses must be text"
     body, document, buffer_id = None, None, ""
     if not call.error:
