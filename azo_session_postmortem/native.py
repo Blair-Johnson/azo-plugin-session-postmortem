@@ -73,14 +73,14 @@ class TraceOpen(_TraceRetrievalTool):
         refresh: bool | None = None,
         preview_chars: int | None = None,
     ) -> str:
-        """Open or resume an investigation; cache its complete catalog in a managed buffer.
+        """Open or resume a trace workspace; cache its catalog in a buffer.
 
         Args:
-            workspace: Workspace directory, relative to the agent session cwd.
-            sessions: Source session IDs, locators, or JSON paths; omit to resume.
-            descendants: Include descendants when opening sources (default true).
-            refresh: Explicitly refresh pinned sources (default false).
-            preview_chars: Inline preview budget (default 6000); zero suppresses the preview, not the full buffer.
+            workspace: Workspace directory.
+            sessions: Session IDs/paths; omit to resume.
+            descendants: Include children (default true).
+            refresh: Reindex sources (default false).
+            preview_chars: Preview chars (default 6000; 0 hides preview).
         """
         return _dispatch(
             "trace_open", workspace, state, sessions=sessions,
@@ -102,16 +102,16 @@ class TraceQuery(_TraceRetrievalTool):
         save_as: str | None = None,
         preview_chars: int | None = None,
     ) -> str:
-        """Run read-only SQL and cache complete rows with stable item selectors.
+        """Run read-only SQL over a workspace; cache rows with item IDs.
 
         Args:
-            workspace: Workspace directory, relative to the agent session cwd.
-            sql: SELECT over sessions, events, objects, links, session_links, map_entries, map_links, map_members, result_items, or saved_queries.
-            params: Named SQL scalar parameter values, e.g. {"role": "user"}.
-            sample: Deterministic sample object with n and optional by (column names) and seed.
-            saved: Run a saved query instead of sql, params, or sample.
-            save_as: Save this query recipe under a caller-chosen name.
-            preview_chars: Inline preview budget (default 6000); complete values remain in the managed buffer.
+            workspace: Workspace directory.
+            sql: Read-only SELECT query.
+            params: Named SQL scalar bindings.
+            sample: Stratified sample: {n, by?, seed?}.
+            saved: Saved query name.
+            save_as: Save recipe under name.
+            preview_chars: Preview chars (default 6000).
         """
         return _dispatch(
             "trace_query", workspace, state, sql=sql, params=params,
@@ -138,21 +138,21 @@ class TraceSearch(_TraceRetrievalTool):
         save_as: str | None = None,
         preview_chars: int | None = None,
     ) -> str:
-        """Search exact evidence or authored map entries; cache every lexical hit.
+        """Search trace evidence or map entries; cache all hits.
 
         Args:
-            workspace: Workspace directory, relative to the agent session cwd.
-            query: Search text or regex, according to mode.
-            scope: One selector: workspace, sessions, entries, refs, items (immutable item IDs), or result with optional cooccur group/rows.
-            mode: terms (default), literal, or regex; embeddings are unsupported.
-            context_lines: Source lines around each hit in the full buffer (default 2); aliases still select exact matching lines.
-            on: source (default), map, or both; raw and authored hits remain separate.
-            collapse: none (default) or exact to group identical occurrences.
-            projection: content (default) excludes transport metadata; all includes every field.
-            follow_object_links: Follow implicit event-to-object references (default true). False keeps event-only selections within their fields; explicit objects remain. Omit with saved.
-            saved: Run a saved search instead of supplying new search selectors.
-            save_as: Save the search recipe under this name.
-            preview_chars: Inline preview budget (default 6000); all hits remain in the managed buffer.
+            workspace: Workspace directory.
+            query: Search text or regex.
+            scope: {workspace:true}, {sessions}, {entries}, {refs}, {items}, or {result, group?, rows?}.
+            mode: terms (default), literal, or regex.
+            context_lines: Context lines (default 2).
+            on: source (default), map, or both.
+            collapse: none (default) or exact.
+            projection: content (default) or all.
+            follow_object_links: Follow event-to-object links (default true).
+            saved: Saved search name.
+            save_as: Save recipe under name.
+            preview_chars: Preview chars (default 6000).
         """
         return _dispatch(
             "trace_search", workspace, state, query=query, scope=scope,
@@ -177,17 +177,17 @@ class TraceRead(_TraceRetrievalTool):
         projection: str | None = None,
         preview_chars: int | None = None,
     ) -> str:
-        """Read exact evidence or map cards into a complete indexed managed buffer.
+        """Read trace evidence or map cards into an indexed buffer.
 
         Args:
-            workspace: Workspace directory, relative to the agent session cwd.
-            targets: Source refs or immutable item IDs; whole event fields, objects, line slices, session event ranges, map cards/anchors, or result selections with optional group/rows. Lines/events are inclusive 1-based; rows are 0-based.
-            before: Preceding event count (default 0).
-            after: Following event count (default 0).
-            pair: Include paired tool calls/results (default true).
-            line_context: Extra lines around line anchors (default 10).
-            projection: content (default) or all; explicit field anchors remain exact.
-            preview_chars: Inline preview budget (default 12000); zero suppresses the preview, never the complete buffer.
+            workspace: Workspace directory.
+            targets: Refs, item IDs, or target objects ({event, field?, lines?}, {object, lines?}, {session, events}, {result, group?, rows?}, {entry, part?}).
+            before: Events before (default 0).
+            after: Events after (default 0).
+            pair: Pair tool calls/results (default true).
+            line_context: Context lines (default 10).
+            projection: content (default) or all.
+            preview_chars: Preview chars (default 12000).
         """
         return _dispatch(
             "trace_read", workspace, state, targets=targets, before=before,
@@ -210,13 +210,13 @@ class TraceEdit(Tool):
         link: list[dict[str, object]] | None = None,
         unlink: list[str] | None = None,
     ) -> str:
-        """Atomically update the authored map, resolving item aliases to exact source anchors.
+        """Atomically update the authored map; resolves item aliases to anchors.
 
         Args:
-            workspace: Workspace directory, relative to the agent session cwd.
-            put: Entry patches; new entries require id, kind (episode/note), title. Omitted fields stay unchanged; null clears note, tags, fields, pinned, details_path. Episodes require anchors (source addresses or item IDs). Use anchors OR add_anchors/remove_anchors, not both.
-            delete: Map entry IDs to delete.
-            link: Relation objects with id, from, to, label and optional note.
+            workspace: Workspace directory.
+            put: Entry patches ({id, kind?, title?, note?, anchors?, add_anchors?, remove_anchors?, tags?, fields?, pinned?, details_path?}).
+            delete: Entry IDs to delete.
+            link: Relations ({id, from, to, label, note?}).
             unlink: Relation IDs to remove.
         """
         return _dispatch(
@@ -238,15 +238,15 @@ class TraceCooccur(_TraceRetrievalTool):
         save_as: str | None = None,
         preview_chars: int | None = None,
     ) -> str:
-        """Join retained event selections; cache all matched/unmatched seeds and witnesses.
+        """Join retained event selections within before/after windows.
 
         Args:
-            workspace: Workspace directory, relative to the agent session cwd.
-            seed: {items:[IDs]} or {result:ID} with optional group (matched/unmatched/witnesses) and rows. Omitted rows select all; [] selects none.
-            against: One to three named conditions with selection (same shape as seed), nonnegative before/after event windows; nested nulls invalid.
-            saved: Rerun a saved cooccur recipe against its fixed input selections; cannot accompany seed/against.
-            save_as: Save selectors and windows as a reusable recipe.
-            preview_chars: Inline preview budget (default 6000); full relations and witness links remain in the managed buffer.
+            workspace: Workspace directory.
+            seed: {items} or {result, group?, rows?}.
+            against: 1-3 conditions: [{name, selection, before, after}].
+            saved: Saved cooccur recipe name.
+            save_as: Save recipe under name.
+            preview_chars: Preview chars (default 6000).
         """
         return _dispatch(
             "trace_cooccur", workspace, state, seed=seed, against=against,
@@ -254,142 +254,28 @@ class TraceCooccur(_TraceRetrievalTool):
         )
 
 
-# Schema generation cannot infer dictionaries or mixed unions. Bare objects also
-# leave providers with no model-visible keys. Keep explicit schemas here, without
-# changing the engine or coercing JSON strings into structured arguments.
+# Keep tool schemas flat and compact; full validation of nested shapes runs
+# inside cache/engine dispatch and exact object formats are documented in SKILL.md.
 def _structured_parameter(component, name, fragment):
     properties = component.schema["function"]["parameters"]["properties"]
     properties[name] = {"description": properties[name]["description"], **fragment}
 
 
-def _object(properties, required):
-    return {"type": "object", "properties": properties,
-            "required": required, "additionalProperties": False}
-
-
-def _array(items, **constraints):
-    return {"type": "array", "items": items, **constraints}
-
-
-def _nullable(schema):
-    return {"anyOf": [schema, {"type": "null"}]}
-
-
-_STRING = {"type": "string"}
-_STRINGS = _array(_STRING)
-_RANGE = _array({"type": "integer", "minimum": 1}, minItems=2, maxItems=2)
-# Closed, fully required alternatives survive strict provider conversion.
-_ROWS = _array({"type": "integer", "minimum": 0})
-_RESULT_ID = {"type": "string", "minLength": 1}
-_GROUP = {"type": "string", "enum": ["matched", "unmatched", "witnesses"]}
-_RESULT_VARIANTS = [
-    _object({"result": _RESULT_ID}, ["result"]),
-    _object({"result": _RESULT_ID, "rows": _ROWS}, ["result", "rows"]),
-    _object({"result": _RESULT_ID, "group": _GROUP}, ["result", "group"]),
-    _object({"result": _RESULT_ID, "group": _GROUP, "rows": _ROWS},
-            ["result", "group", "rows"]),
-]
-_ITEMS = _object({"items": _array(_RESULT_ID)}, ["items"])
-_RESULT_SELECTION = {"anyOf": [*_RESULT_VARIANTS, _ITEMS]}
-_ADDRESS_VARIANTS = [
-    _STRING,
-    _object({"event": _STRING, "field": _STRING, "lines": _RANGE}, ["event"]),
-    _object({"object": _STRING, "lines": _RANGE}, ["object"]),
-    _object({"session": _STRING, "events": _RANGE}, ["session", "events"]),
-    *_RESULT_VARIANTS,
-    # Separate whole-content branches survive providers requiring every property.
-    # Keep the richer variants above for slices and existing optional defaults.
-    _object({"event": _STRING, "field": _STRING}, ["event", "field"]),
-    _object({"object": _STRING}, ["object"]),
-]
-_SOURCE_ANCHOR = {"anyOf": [*_ADDRESS_VARIANTS,
-    _object({"entry": _STRING, "part": {"type": "string", "enum": ["anchors"]}},
-            ["entry", "part"]),
-]}
-_READ_TARGET = {"anyOf": [*_ADDRESS_VARIANTS,
-    _object({"entry": _STRING, "part": {"type": "string", "enum": ["card", "anchors"]}},
-            ["entry"]),
-]}
-_ANCHORS = _array(_SOURCE_ANCHOR)
-
-# These two dictionaries intentionally have caller-chosen keys. Do not close them
-# with additionalProperties=False: that advertises only {} and loses valid data.
-# SQL bindings are SQLite scalar values; authored fields allow arbitrary JSON.
-_PARAMS = {"type": "object", "additionalProperties": {
-    "type": ["string", "number", "boolean", "null"],
-}}
-_FIELDS = {"type": "object", "additionalProperties": True}
-_PATCH = _object({
-    "id": {"type": "string", "minLength": 1},
-    "kind": {"type": "string", "enum": ["episode", "note"]},
-    "title": _STRING,
-    "note": _nullable(_STRING),
-    "anchors": _ANCHORS,
-    "tags": _nullable(_STRINGS),
-    "fields": {**_nullable(_FIELDS), "description":
-               "Authored JSON object with arbitrary keys; merges by key. Null values "
-               "delete keys; null clears all fields. Omit to preserve existing fields."},
-    "pinned": _nullable({"type": "boolean"}),
-    "details_path": _nullable(_STRING),
-    "add_anchors": _ANCHORS,
-    "remove_anchors": _ANCHORS,
-}, ["id"])
-_RELATION = _object({
-    "id": {"type": "string", "minLength": 1},
-    "from": {"type": "string", "minLength": 1},
-    "to": {"type": "string", "minLength": 1},
-    "label": {"type": "string", "minLength": 1},
-    "note": _nullable(_STRING),
-}, ["id", "from", "to", "label"])
-_SAMPLE = _object({
-    "n": {"type": "integer", "minimum": 0},
-    "by": _STRINGS,
-    "seed": {"type": ["number", "string", "boolean", "null"]},
-}, ["n"])
-_SCOPE = {"anyOf": [
-    _object({"workspace": {"type": "boolean", "enum": [True]}}, ["workspace"]),
-    _object({"sessions": _STRINGS}, ["sessions"]),
-    _object({"entries": _STRINGS}, ["entries"]),
-    _object({"refs": _ANCHORS}, ["refs"]),
-    *_RESULT_VARIANTS,
-    _ITEMS,
-]}
-
-
-_COOCCUR_CONDITION = _object({
-    "name": {"type": "string", "minLength": 1,
-             "description": "Unique condition name; seed is reserved."},
-    "selection": _RESULT_SELECTION,
-    "before": {"type": "integer", "minimum": 0},
-    "after": {"type": "integer", "minimum": 0},
-}, ["name", "selection", "before", "after"])
+_NULLABLE_OBJECT = {"type": ["object", "null"]}
+_NULLABLE_OBJECT_ARRAY = {"type": ["array", "null"], "items": {"type": "object"}}
+_TARGET_ARRAY = {"type": "array", "items": {"type": ["string", "object"]}}
 
 for _component, _name, _schema in (
-    (TraceCooccur, "seed", _RESULT_SELECTION),
-    (TraceCooccur, "against", _array(_COOCCUR_CONDITION, minItems=1, maxItems=3)),
-    (TraceQuery, "params", _PARAMS),
-    (TraceQuery, "sample", _SAMPLE),
-    (TraceSearch, "scope", _SCOPE),
-    (TraceEdit, "put", _array(_PATCH)),
-    (TraceEdit, "link", _array(_RELATION)),
+    (TraceQuery, "params", _NULLABLE_OBJECT),
+    (TraceQuery, "sample", _NULLABLE_OBJECT),
+    (TraceSearch, "scope", _NULLABLE_OBJECT),
+    (TraceEdit, "put", _NULLABLE_OBJECT_ARRAY),
+    (TraceEdit, "link", _NULLABLE_OBJECT_ARRAY),
+    (TraceCooccur, "seed", _NULLABLE_OBJECT),
+    (TraceCooccur, "against", _NULLABLE_OBJECT_ARRAY),
+    (TraceRead, "targets", _TARGET_ARRAY),
 ):
-    _structured_parameter(_component, _name, _nullable(_schema))
-for _component, _name, _values in (
-    (TraceSearch, "mode", ["terms", "literal", "regex"]),
-    (TraceSearch, "on", ["source", "map", "both"]),
-    (TraceSearch, "collapse", ["none", "exact"]),
-    (TraceSearch, "projection", ["content", "all"]),
-    (TraceRead, "projection", ["content", "all"]),
-):
-    _structured_parameter(_component, _name,
-                          _nullable({"type": "string", "enum": _values}))
-
-_structured_parameter(TraceRead, "targets", _array(_READ_TARGET))
-for _component in (TraceOpen, TraceQuery, TraceSearch, TraceRead, TraceCooccur):
-    _structured_parameter(_component, "preview_chars",
-                          _nullable({"type": "integer", "minimum": 0}))
-_structured_parameter(TraceSearch, "context_lines",
-                      _nullable({"type": "integer", "minimum": 0}))
+    _structured_parameter(_component, _name, _schema)
 
 trace_open = TraceOpen()
 trace_query = TraceQuery()

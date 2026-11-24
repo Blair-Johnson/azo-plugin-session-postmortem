@@ -154,6 +154,25 @@ a durable source reference. Reopen with `trace_open`, read the relevant card, an
 to its evidence or prior result pointer. Write reports in ordinary files, optionally
 linked by `details_path`; the map need not duplicate the report.
 
+## Input object formats
+
+Tool schemas intentionally stay compact; runtime validation enforces exact shapes:
+
+- **Source addresses (`targets`, `anchors`, `add_anchors`, `remove_anchors`, `scope.refs`):**
+  - String ref or immutable item ID: `"S/e1"`, `"S/o1"`, `"S17-H001"`, `"C20-W001"`.
+  - Event / field / line slice (1-based inclusive `lines`): `{"event": "S/e1"}`, `{"event": "S/e1", "field": "text"}`, or `{"event": "S/e1", "field": "text", "lines": [2, 9]}`.
+  - Object / line slice: `{"object": "S/o1"}` or `{"object": "S/o1", "lines": [1, 20]}`.
+  - Session event range (1-based inclusive): `{"session": "S", "events": [10, 25]}`.
+  - Result selection (0-based `rows`; omitted selects all, `[]` selects none; `group` is `"matched" | "unmatched" | "witnesses"`): `{"result": "r1"}`, `{"result": "r1", "rows": [0, 3]}`, `{"result": "C20", "group": "matched"}`, or `{"result": "C20", "group": "witnesses", "rows": [0]}`.
+  - Map entry (in `trace_read.targets`: `"part"` defaults to `"card"` or `"anchors"`; in `anchors`/`scope.refs`: `"part": "anchors"` is required): `{"entry": "ep1", "part": "card"}` or `{"entry": "ep1", "part": "anchors"}`.
+- **`trace_search.scope`** (exactly one selector): `{"workspace": true}`, `{"sessions": ["S"]}`, `{"entries": ["ep1"]}`, `{"refs": [<address>, ...]}`, `{"items": ["S17-H001"]}`, or a result selection `{"result": ..., "group"?: ..., "rows"?: [...]}`.
+  Enums: `mode` (`"terms" | "literal" | "regex"`), `on` (`"source" | "map" | "both"`), `collapse` (`"none" | "exact"`), `projection` (`"content" | "all"`).
+- **`trace_query`**: `sql` is a read-only `SELECT` over `sessions`, `events`, `objects`, `links`, `session_links`, `map_entries`, `map_links`, `map_members`, `result_items`, or `saved_queries`. `params` maps names to SQL scalars (`string | number | boolean | null`). `sample` is `{"n": <int>=0, "by"?: ["col", ...], "seed"?: <scalar>}`.
+- **`trace_cooccur`**: `seed` is `{"items": [<id>, ...]}` or `{"result": <id>, "group"?: ..., "rows"?: [...]}` (nested `null` values such as `rows: null` are invalid). `against` is 1–3 objects: `{"name": "<unique, not 'seed'>", "selection": <seed-shape>, "before": <int>=0, "after": <int>=0}`.
+- **`trace_edit`**:
+  - `put` items: `{"id": "<str>", "kind"?: "episode"|"note", "title"?: "<str>", "note"?: "<str>|null", "anchors"?: [<source-anchor>], "add_anchors"?: [<source-anchor>], "remove_anchors"?: [<source-anchor>], "tags"?: ["..."]|null, "fields"?: {<arbitrary JSON>}|null, "pinned"?: bool|null, "details_path"?: "<str>|null"}`. New entries require `id`, `kind`, `title` (episodes also require `anchors`). Omitted fields stay unchanged; `null` clears optional fields; `fields` merges by key (`{"k": null}` deletes key `k`, `fields: null` clears all). Use `anchors` OR `add_anchors`/`remove_anchors`, not both.
+  - `link` items: `{"id": "<str>", "from": "<entry_id>", "to": "<entry_id>", "label": "<str>", "note"?: "<str>|null"}`.
+
 ## Worked recipes
 
 Read the relevant section of `references/recipes.md`; these are alternatives, not a checklist:

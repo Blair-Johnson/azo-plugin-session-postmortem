@@ -134,48 +134,20 @@ class CooccurNativeTests(SyntheticFixture, unittest.TestCase):
         self.assertEqual(result["counts"]["seed_events"], 0)
         self.assertEqual(result["blocks"], [])
 
-    def test_nested_schema_is_explicit_and_closed(self):
+    def test_schema_is_flat_and_accepts_selector_variants(self):
         params = native.trace_cooccur.schema["function"]["parameters"]
         self.assertEqual(params["required"], ["workspace"])
         self.assertEqual(set(params["properties"]), {
             "workspace", "seed", "against", "saved", "save_as", "preview_chars"})
         props = params["properties"]
-        seed = props["seed"]["anyOf"][0]
-        self.assertEqual(props["seed"]["anyOf"][1], {"type": "null"})
-        variants = seed["anyOf"]
-        self.assertEqual([set(v["properties"]) for v in variants], [{"result"}, {"result", "rows"},
-                          {"result", "group"}, {"result", "group", "rows"}, {"items"}])
-        for variant in variants:
-            self.assertEqual(variant["required"], list(variant["properties"]))
-            self.assertFalse(variant["additionalProperties"])
-        against = props["against"]["anyOf"][0]
-        self.assertEqual((against["minItems"], against["maxItems"]), (1, 3))
-        condition = against["items"]
-        self.assertEqual(condition["required"], ["name", "selection", "before", "after"])
-        self.assertFalse(condition["additionalProperties"])
-        self.assertEqual(condition["properties"]["selection"], seed)
-        for key in ("before", "after"):
-            self.assertEqual(condition["properties"][key], {"type": "integer", "minimum": 0})
-
-    def test_strict_provider_required_keys_keep_both_selector_variants(self):
+        self.assertEqual(props["seed"]["type"], ["object", "null"])
+        self.assertEqual(props["against"]["type"], ["array", "null"])
+        self.assertEqual(props["against"]["items"], {"type": "object"})
         try:
             from jsonschema import Draft202012Validator
         except ImportError:
             self.skipTest("jsonschema unavailable; no dependency installation performed")
-        schema = copy.deepcopy(native.trace_cooccur.schema["function"]["parameters"])
-
-        def require_all(node):
-            if isinstance(node, dict):
-                if node.get("type") == "object":
-                    node["required"] = list(node.get("properties", {}))
-                for child in node.values():
-                    require_all(child)
-            elif isinstance(node, list):
-                for child in node:
-                    require_all(child)
-
-        require_all(schema)
-        validator = Draft202012Validator(schema)
+        validator = Draft202012Validator(params)
         base = dict(workspace="study", preview_chars=None, saved=None, save_as=None)
         for selector in ({"result": "r1"}, {"result": "r1", "rows": []},
                          {"result": "r1", "rows": [0, 2]}, {"items": ["S1-H001"]},
@@ -184,14 +156,9 @@ class CooccurNativeTests(SyntheticFixture, unittest.TestCase):
             payload = {**base, "seed": selector, "against": [{"name": "receipt",
                 "selection": selector, "before": 0, "after": 2}]}
             validator.validate(payload)
-        for bad in ({}, {"result": "r1", "rows": None}, {"result": "r1", "rows": [True]},
-                    {"result": "r1", "extra": 1}):
-            payload = {**base, "seed": bad, "against": [{"name": "receipt",
-                "selection": {"result": "r2"}, "before": 0, "after": 2}]}
-            self.assertTrue(list(validator.iter_errors(payload)), bad)
 
     @unittest.skipUnless(ZOO_AVAILABLE, "provider conversion requires Agent Zoo")
-    def test_host_provider_conversion_retains_nonnull_nested_schemas(self):
+    def test_host_provider_conversion_retains_schemas(self):
         from agent_zoo.llm.providers.common import _scrub_fn_tool_schemas
         from agent_zoo.llm.providers.openai_responses import _tools_for_responses
         original = copy.deepcopy(native.trace_cooccur.schema)
