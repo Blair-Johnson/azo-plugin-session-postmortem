@@ -16,7 +16,7 @@ from unittest.mock import patch
 HOST_AVAILABLE = importlib.util.find_spec("agent_utils") is not None
 ZOO_AVAILABLE = importlib.util.find_spec("agent_zoo") is not None
 if HOST_AVAILABLE:
-    from agent_utils.core.events import RenderRequested, RunToolCall, ToolCallFinished
+    from agent_utils.core.events import RenderRequested, RunToolCall, SessionStarted, ToolCallFinished
     from agent_utils.core.session import Session
     from agent_utils.core.state import State, ToolCall
     from agent_utils.features.buffers.manager import BufferManager
@@ -94,6 +94,7 @@ class NativeTests(unittest.TestCase):
             native.register_features(builder, session=session, config={})
             pipeline = builder.build()
             pipeline.init_state(session.state)
+            pipeline.step(session.state, SessionStarted())
             pipeline.step(session.state, RenderRequested())
             for component in native.TOOLS:
                 published = session.state.tool_schemas[component.name]
