@@ -1,45 +1,240 @@
 """Native Agent Zoo tools; cached evidence remains independent of the host."""
 
+from collections.abc import Iterator
+from concurrent.futures import Future, ThreadPoolExecutor
+from dataclasses import dataclass, field
 from pathlib import Path
+import threading
+import time
+from typing import Any
 
-from agent_utils.core.events import Event, RenderRequested, TurnSettled
+from agent_utils.core.events import (
+    Event,
+    IoCompleted,
+    IoFailed,
+    RenderRequested,
+    SessionRestored,
+    TurnSettled,
+)
+from agent_utils.core.io import IoRequest, OpId
 from agent_utils.core.pipeline import EmitFn, Feature
 from agent_utils.core.state import State
 from agent_utils.core.tool import Tool
 from agent_utils.features.buffers.tools import resolve_session_path
 from agent_utils.features.skills import SkillSource, parse_skill_text
+from agent_utils.runtime.driver import Driver
 
 from . import cache, cache_render
 
 try:
     from agent_zoo.events import SessionReady as _SessionReady
-    _SKILL_EVENTS: tuple[type[Event], ...] = (_SessionReady, RenderRequested, TurnSettled)
+    _SKILL_EVENTS: tuple[type[Event], ...] = (
+        _SessionReady,
+        SessionRestored,
+        RenderRequested,
+        TurnSettled,
+    )
 except ImportError:
-    _SKILL_EVENTS = (RenderRequested, TurnSettled)
+    _SKILL_EVENTS = (SessionRestored, RenderRequested, TurnSettled)
 
 
 _CWD_READS = {"cwd", "session_cwd", "terminal_cwd"}
 _RETRIEVAL_READS = _CWD_READS | {"buffer_manager", "step"}
 
 
-def _resolve_path(raw: str, state: State | None) -> Path:
-    return Path(resolve_session_path(raw, state)).expanduser().resolve()
+@dataclass
+class PostmortemDispatchRequest(IoRequest):
+    """Typed Sans-I/O request offloading postmortem workspace I/O to ``PostmortemDriver``."""
+
+    tool_name: str
+    arguments: dict[str, Any] = field(default_factory=dict)
+    cwd: str = ""
+    home_dir: str = ""
 
 
-def _dispatch(name, workspace, state, **arguments):
+class _PathContext:
+    __slots__ = ("cwd", "home_dir")
+
+    def __init__(self, cwd: str, home_dir: str) -> None:
+        self.cwd = cwd
+        self.home_dir = home_dir
+
+
+class PostmortemDriver(Driver):
+    """Commit-class driver executing ``PostmortemDispatchRequest`` on a dedicated worker."""
+
+    request_types = (PostmortemDispatchRequest,)
+    durability = "commit"
+
+    def __init__(self) -> None:
+        super().__init__()
+        self._cond = threading.Condition(threading.RLock())
+        self._executor: ThreadPoolExecutor | None = None
+        self._futures: dict[OpId, Future[Any]] = {}
+        self._cancelled: set[OpId] = set()
+        self._closing = False
+        self._closed = False
+
+    def _ensure_executor_locked(self) -> ThreadPoolExecutor:
+        if self._executor is None:
+            self._executor = ThreadPoolExecutor(
+                max_workers=1,
+                thread_name_prefix="azo-postmortem",
+            )
+        return self._executor
+
+    @staticmethod
+    def _prepare_arguments(req: PostmortemDispatchRequest) -> dict[str, Any]:
+        arguments = dict(req.arguments)
+        ctx = _PathContext(req.cwd, req.home_dir)
+        raw_workspace = str(arguments.get("workspace") or "")
+        arguments["workspace"] = str(
+            Path(resolve_session_path(raw_workspace, ctx)).expanduser().resolve()  # type: ignore[arg-type]
+        )
+        if req.tool_name == "trace_open" and isinstance(arguments.get("sessions"), list):
+            sources = []
+            for source in arguments["sessions"]:
+                if isinstance(source, str) and source:
+                    candidate = Path(
+                        resolve_session_path(source, ctx)  # type: ignore[arg-type]
+                    ).expanduser().resolve()
+                    if (
+                        candidate.exists()
+                        or "/" in source
+                        or "\\" in source
+                        or source.endswith(".json")
+                    ):
+                        source = str(candidate)
+                sources.append(source)
+            arguments["sessions"] = sources
+        return arguments
+
+    @classmethod
+    def execute_request(cls, req: PostmortemDispatchRequest) -> dict[str, Any]:
+        """Resolve paths and dispatch a single postmortem request (driver-side I/O)."""
+        arguments = cls._prepare_arguments(req)
+        return cache.dispatch(req.tool_name, arguments)
+
+    def start(self, emit: EmitFn) -> None:
+        super().start(emit)
+        with self._cond:
+            self._closing = False
+            self._closed = False
+            self._ensure_executor_locked()
+
+    def submit(self, op_id: OpId, req: IoRequest) -> None:
+        if not isinstance(req, PostmortemDispatchRequest):
+            raise TypeError(
+                f"PostmortemDriver expected PostmortemDispatchRequest, got {type(req).__name__}"
+            )
+        with self._cond:
+            if self._closing or self._closed or op_id in self._cancelled:
+                return
+            executor = self._ensure_executor_locked()
+            fut = executor.submit(self._run_op, op_id, req)
+            self._futures[op_id] = fut
+
+    def cancel(self, op_id: OpId) -> None:
+        with self._cond:
+            self._cancelled.add(op_id)
+            fut = self._futures.get(op_id)
+            if fut is not None and fut.cancel():
+                self._futures.pop(op_id, None)
+                self._cancelled.discard(op_id)
+                self._cond.notify_all()
+
+    def drain(self, *, timeout_s: float | None = None) -> None:
+        deadline = (
+            None
+            if timeout_s is None
+            else (time.monotonic() + max(0.0, float(timeout_s)))
+        )
+        with self._cond:
+            while self._futures and not self._closed:
+                if deadline is not None:
+                    remaining = deadline - time.monotonic()
+                    if remaining <= 0:
+                        return
+                    self._cond.wait(timeout=min(remaining, 0.25))
+                else:
+                    self._cond.wait(timeout=0.25)
+
+    def quiesce(
+        self,
+        *,
+        policy: str = "terminate",
+        deadline: float | None = None,
+    ) -> list[Event]:
+        del policy
+        remaining = (
+            None
+            if deadline is None
+            else max(0.0, float(deadline) - time.monotonic())
+        )
+        self.drain(timeout_s=remaining)
+        return []
+
+    def close(self) -> None:
+        with self._cond:
+            self._closing = True
+            executor = self._executor
+            self._cond.notify_all()
+        self.drain(timeout_s=5.0)
+        if executor is not None:
+            executor.shutdown(wait=True, cancel_futures=False)
+        with self._cond:
+            self._closed = True
+            self._executor = None
+            self._futures.clear()
+            self._cancelled.clear()
+            self._cond.notify_all()
+
+    def _is_fenced(self, op_id: OpId) -> bool:
+        with self._cond:
+            return self._closed or op_id in self._cancelled
+
+    def _run_op(self, op_id: OpId, req: PostmortemDispatchRequest) -> None:
+        if self._is_fenced(op_id):
+            with self._cond:
+                self._futures.pop(op_id, None)
+                self._cancelled.discard(op_id)
+                self._cond.notify_all()
+            return
+        try:
+            result = self.execute_request(req)
+            if not self._is_fenced(op_id):
+                self._safe_emit(IoCompleted(op_id=op_id, value=result))
+        except Exception as exc:
+            if not self._is_fenced(op_id):
+                self._safe_emit(IoFailed(op_id=op_id, error=exc))
+        finally:
+            with self._cond:
+                self._futures.pop(op_id, None)
+                self._cancelled.discard(op_id)
+                self._cond.notify_all()
+
+
+def _session_cwd(state: State | None) -> str:
+    if state is None:
+        return ""
+    return str(
+        getattr(state, "cwd", "")
+        or getattr(state, "session_cwd", "")
+        or getattr(state, "terminal_cwd", "")
+        or ""
+    ).strip()
+
+
+def _dispatch_gen(
+    name: str,
+    workspace: str,
+    state: State,
+    **arguments: Any,
+) -> Iterator[PostmortemDispatchRequest]:
     if not isinstance(workspace, str) or not workspace.strip():
         raise ValueError("workspace must be a nonempty directory path")
-    arguments = {key: value for key, value in arguments.items() if value is not None}
-    arguments["workspace"] = str(_resolve_path(workspace, state))
-    if name == "trace_open" and isinstance(arguments.get("sessions"), list):
-        sources = []
-        for source in arguments["sessions"]:
-            if isinstance(source, str) and source:
-                candidate = _resolve_path(source, state)
-                if candidate.exists() or "/" in source or "\\" in source or source.endswith(".json"):
-                    source = str(candidate)
-            sources.append(source)
-        arguments["sessions"] = sources
+    cleaned = {key: value for key, value in arguments.items() if value is not None}
+    cleaned["workspace"] = resolve_session_path(workspace, state)
     manager = None
     if name != "trace_edit":
         manager = getattr(state, "buffer_manager", None)
@@ -47,7 +242,12 @@ def _dispatch(name, workspace, state, **arguments):
         # result identity, or durable text file. Never fabricate buffer handles.
         if manager is None or not callable(getattr(manager, "create_scratch_buffer", None)):
             raise ValueError("retrieval requires the host BufferManager")
-    result = cache.dispatch(name, arguments)
+    result = yield PostmortemDispatchRequest(
+        tool_name=name,
+        arguments=cleaned,
+        cwd=_session_cwd(state),
+        home_dir=str(getattr(state, "home_dir", "") or ""),
+    )
     buffer_id = ""
     if manager is not None:
         buffer_id, _ = manager.create_scratch_buffer(
@@ -72,7 +272,7 @@ class TraceOpen(_TraceRetrievalTool):
         descendants: bool | None = None,
         refresh: bool | None = None,
         preview_chars: int | None = None,
-    ) -> str:
+    ) -> Iterator[PostmortemDispatchRequest]:
         """Open or resume a trace workspace; cache its catalog in a buffer.
 
         Args:
@@ -82,10 +282,10 @@ class TraceOpen(_TraceRetrievalTool):
             refresh: Reindex sources (default false).
             preview_chars: Preview chars (default 6000; 0 hides preview).
         """
-        return _dispatch(
+        return (yield from _dispatch_gen(
             "trace_open", workspace, state, sessions=sessions,
             descendants=descendants, refresh=refresh, preview_chars=preview_chars,
-        )
+        ))
 
 
 class TraceQuery(_TraceRetrievalTool):
@@ -101,7 +301,7 @@ class TraceQuery(_TraceRetrievalTool):
         saved: str | None = None,
         save_as: str | None = None,
         preview_chars: int | None = None,
-    ) -> str:
+    ) -> Iterator[PostmortemDispatchRequest]:
         """Run read-only SQL over a workspace; cache rows with item IDs.
 
         Args:
@@ -113,10 +313,10 @@ class TraceQuery(_TraceRetrievalTool):
             save_as: Save recipe under name.
             preview_chars: Preview chars (default 6000).
         """
-        return _dispatch(
+        return (yield from _dispatch_gen(
             "trace_query", workspace, state, sql=sql, params=params,
             sample=sample, saved=saved, save_as=save_as, preview_chars=preview_chars,
-        )
+        ))
 
 
 class TraceSearch(_TraceRetrievalTool):
@@ -137,7 +337,7 @@ class TraceSearch(_TraceRetrievalTool):
         saved: str | None = None,
         save_as: str | None = None,
         preview_chars: int | None = None,
-    ) -> str:
+    ) -> Iterator[PostmortemDispatchRequest]:
         """Search trace evidence or map entries; cache all hits.
 
         Args:
@@ -154,12 +354,12 @@ class TraceSearch(_TraceRetrievalTool):
             save_as: Save recipe under name.
             preview_chars: Preview chars (default 6000).
         """
-        return _dispatch(
+        return (yield from _dispatch_gen(
             "trace_search", workspace, state, query=query, scope=scope,
             mode=mode, context_lines=context_lines, on=on, collapse=collapse,
             projection=projection, follow_object_links=follow_object_links,
             saved=saved, save_as=save_as, preview_chars=preview_chars,
-        )
+        ))
 
 
 class TraceRead(_TraceRetrievalTool):
@@ -176,7 +376,7 @@ class TraceRead(_TraceRetrievalTool):
         line_context: int | None = None,
         projection: str | None = None,
         preview_chars: int | None = None,
-    ) -> str:
+    ) -> Iterator[PostmortemDispatchRequest]:
         """Read trace evidence or map cards into an indexed buffer.
 
         Args:
@@ -189,11 +389,11 @@ class TraceRead(_TraceRetrievalTool):
             projection: content (default) or all.
             preview_chars: Preview chars (default 12000).
         """
-        return _dispatch(
+        return (yield from _dispatch_gen(
             "trace_read", workspace, state, targets=targets, before=before,
             after=after, pair=pair, line_context=line_context,
             projection=projection, preview_chars=preview_chars,
-        )
+        ))
 
 
 class TraceEdit(Tool):
@@ -209,7 +409,7 @@ class TraceEdit(Tool):
         delete: list[str] | None = None,
         link: list[dict[str, object]] | None = None,
         unlink: list[str] | None = None,
-    ) -> str:
+    ) -> Iterator[PostmortemDispatchRequest]:
         """Atomically update the authored map; resolves item aliases to anchors.
 
         Args:
@@ -219,10 +419,10 @@ class TraceEdit(Tool):
             link: Relations ({id, from, to, label, note?}).
             unlink: Relation IDs to remove.
         """
-        return _dispatch(
+        return (yield from _dispatch_gen(
             "trace_edit", workspace, state, put=put, delete=delete,
             link=link, unlink=unlink,
-        )
+        ))
 
 
 class TraceCooccur(_TraceRetrievalTool):
@@ -237,7 +437,7 @@ class TraceCooccur(_TraceRetrievalTool):
         saved: str | None = None,
         save_as: str | None = None,
         preview_chars: int | None = None,
-    ) -> str:
+    ) -> Iterator[PostmortemDispatchRequest]:
         """Join retained event selections within before/after windows.
 
         Args:
@@ -248,10 +448,10 @@ class TraceCooccur(_TraceRetrievalTool):
             save_as: Save recipe under name.
             preview_chars: Preview chars (default 6000).
         """
-        return _dispatch(
+        return (yield from _dispatch_gen(
             "trace_cooccur", workspace, state, seed=seed, against=against,
             saved=saved, save_as=save_as, preview_chars=preview_chars,
-        )
+        ))
 
 
 # Keep tool schemas flat and compact; full validation of nested shapes runs
@@ -287,6 +487,13 @@ trace_cooccur = TraceCooccur()
 TOOLS = (trace_open, trace_query, trace_search, trace_read, trace_edit, trace_cooccur)
 
 
+@dataclass
+class _PostmortemSkillRuntime:
+    """Ephemeral per-session runtime state tracking skill registration."""
+
+    registry: Any = None
+
+
 class SessionPostmortemSkill:
     """Publish the bundled skill before the harness renders its skill catalog."""
 
@@ -295,51 +502,49 @@ class SessionPostmortemSkill:
     writes = {"skill_registry"}
 
     def __init__(self) -> None:
-        self._registry = None
-        self._cached_source: SkillSource | None = None
-        self._cached_entry = None
+        self._cached_source, self._cached_entry = self._preload_bundled_skill()
 
-    def _load_bundled_skill(self):
-        if self._cached_source is None or self._cached_entry is None:
-            skill_root = Path(__file__).resolve().parent / "skills" / "session-postmortem"
-            skill_file = skill_root / "SKILL.md"
-            resources = tuple(
-                sorted(
-                    p.relative_to(skill_root).as_posix()
-                    for p in skill_root.rglob("*")
-                    if p.is_file() and p != skill_file
-                )
+    @staticmethod
+    def _preload_bundled_skill():
+        skill_root = Path(__file__).resolve().parent / "skills" / "session-postmortem"
+        skill_file = skill_root / "SKILL.md"
+        resources = tuple(
+            sorted(
+                p.relative_to(skill_root).as_posix()
+                for p in skill_root.rglob("*")
+                if p.is_file() and p != skill_file
             )
-            source = SkillSource(
-                path=str(skill_root),
-                kind="azo-plugin-session-postmortem",
-                scope="bundled",
-                precedence=-5000,
-                native=True,
-                always_list=True,
-            )
-            entry = parse_skill_text(
-                str(skill_file),
-                skill_file.read_text(encoding="utf-8"),
-                source=source,
-                resources=resources,
-            )
-            self._cached_source = source
-            self._cached_entry = entry
-        return self._cached_source, self._cached_entry
+        )
+        source = SkillSource(
+            path=str(skill_root),
+            kind="azo-plugin-session-postmortem",
+            scope="bundled",
+            precedence=-5000,
+            native=True,
+            always_list=True,
+        )
+        entry = parse_skill_text(
+            str(skill_file),
+            skill_file.read_text(encoding="utf-8"),
+            source=source,
+            resources=resources,
+        )
+        return source, entry
 
     def handle(self, event: Event, state: State, emit: EmitFn) -> None:
         del event, emit
         registry = getattr(state, "skill_registry", None)
-        if registry is not None and registry is not self._registry:
-            source, entry = self._load_bundled_skill()
-            registry.add_sources([source])
-            registry.register_entry(entry)
-            self._registry = registry
+        if registry is None:
+            return
+        rt = state.runtime("session_postmortem", _PostmortemSkillRuntime)
+        if registry is not rt.registry:
+            registry.add_sources([self._cached_source])
+            registry.register_entry(self._cached_entry)
+            rt.registry = registry
 
 
 def register_features(builder, *, session, config):
-    """Register six tools and their bundled skill in both common-scope pipelines."""
+    """Register six tools, their bundled skill, and commit-class PostmortemDriver."""
     del session, config
     from agent_zoo.features.system_prompt import SystemPromptSkillList
 
@@ -347,4 +552,5 @@ def register_features(builder, *, session, config):
         name="session_postmortem",
         components=[SessionPostmortemSkill(), *TOOLS],
         order=[SessionPostmortemSkill, SystemPromptSkillList],
+        drivers=[PostmortemDriver],
     ))

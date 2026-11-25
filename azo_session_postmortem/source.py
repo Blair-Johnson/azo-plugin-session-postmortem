@@ -130,17 +130,56 @@ def _load(path):
 
 
 def _identity(doc, path):
+    features = doc.get("features") if isinstance(doc.get("features"), dict) else {}
+    fsess = features.get("session") if isinstance(features.get("session"), dict) else {}
+    if "__durable_v__" in fsess and isinstance(fsess.get("__data__"), dict):
+        fsess = fsess["__data__"]
     attrs = doc.get("attrs") or {}
     live = attrs.get("_live_metadata") or {}
     meta = doc.get("meta") or {}
-    sid = doc.get("id") or doc.get("session_id") or meta.get("session_id") or attrs.get("_session_id")
+    sid = (doc.get("id") or doc.get("session_id") or meta.get("session_id") or
+           fsess.get("session_id") or attrs.get("_session_id"))
     if not isinstance(sid, str) or not sid:
         raise SourceError(f"Source has no session identity: {path}")
     parent = (doc.get("parent_id") or doc.get("parent_session_id") or
+              fsess.get("parent_session_id") or
               attrs.get("_parent_session_id") or attrs.get("_rlm_parent_session_id") or
               live.get("parent_session_id") or meta.get("parent_session_id"))
-    title = doc.get("title") or attrs.get("_session_title") or live.get("title") or meta.get("title") or sid
+    title = (doc.get("title") or fsess.get("title") or
+             attrs.get("_session_title") or live.get("title") or meta.get("title") or sid)
     return sid, parent or None, str(title)
+
+
+def _extract_rlm_jobs(doc):
+    """Extract normalized RLM job metadata from ``attrs['rlm_jobs']`` without unpickling."""
+    attrs = doc.get("attrs") if isinstance(doc.get("attrs"), dict) else {}
+    raw_jobs = _plain(attrs.get("rlm_jobs"))
+    if not isinstance(raw_jobs, dict):
+        return {}
+    extracted = {}
+    for key, raw in raw_jobs.items():
+        if not isinstance(key, str) or not key:
+            continue
+        item = _plain(raw)
+        if not isinstance(item, dict):
+            continue
+        job_id = str(item.get("job_id") or key).strip()
+        if not job_id:
+            continue
+        meta = _plain(item.get("metadata"))
+        meta = meta if isinstance(meta, dict) else {}
+        child = str(item.get("child_session_id") or meta.get("child_session_id") or "").strip()
+        raw_outputs = _plain(item.get("output_map"))
+        if not isinstance(raw_outputs, dict):
+            raw_outputs = _plain(meta.get("parent_output_map"))
+        output_map = {}
+        if isinstance(raw_outputs, dict):
+            for out_name, handle in raw_outputs.items():
+                if isinstance(out_name, str) and out_name and isinstance(handle, str) and handle:
+                    output_map[out_name] = handle
+        if child or output_map:
+            extracted[job_id] = {"child_session_id": child, "output_map": output_map}
+    return extracted
 
 
 def _children(doc, path, sid):
@@ -448,7 +487,7 @@ def _objects(doc, sid, events, links):
 
 
 def _normalize(doc, path, warnings, provenance):
-    for key in ("meta", "attrs", "components"):
+    for key in ("meta", "attrs", "components", "features"):
         if doc.get(key) is not None and not isinstance(doc[key], dict):
             raise SourceError(f"Session {key} must be an object: {path}")
     for key in ("entries", "events", "trace_objects", "trace_links"):
@@ -481,6 +520,9 @@ def _normalize(doc, path, warnings, provenance):
         links.append(dict(src=parent, dst=sid, kind="child"))
     result = dict(id=sid, parent_id=parent, title=title, source=str(path),
                   events=events, objects=objects, links=links, warnings=list(warnings))
+    rlm_jobs = _extract_rlm_jobs(doc)
+    if rlm_jobs:
+        result["rlm_jobs"] = rlm_jobs
     if provenance:
         result["provenance"] = provenance
     return result

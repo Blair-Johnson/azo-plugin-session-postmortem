@@ -9,7 +9,8 @@ from unittest.mock import patch
 
 HOST = importlib.util.find_spec("agent_utils") is not None
 if HOST:
-    from agent_utils.core.events import RunToolCall, ToolCallFinished
+    from agent_utils.core.events import IoCompleted, IoFailed, RunToolCall, ToolCallFinished
+    from agent_utils.core.io import SubmitOp
     from agent_utils.core.state import State, ToolCall
     from agent_utils.features.buffers.manager import BufferManager
     from azo_session_postmortem import native
@@ -30,8 +31,17 @@ class CacheNativeTests(unittest.TestCase):
         args = {"workspace": "study", **arguments}
         call = ToolCall(id="cache-native", name=name, raw_args=json.dumps(args), parsed_args=args)
         self.state.pending_tool_calls = [call]
+        component = getattr(native, name)
         emitted = []
-        getattr(native, name).handle(RunToolCall(call), self.state, emitted.append)
+        component.handle(RunToolCall(call), self.state, emitted.append)
+        for eff in self.state.io.take_outbox():
+            if isinstance(eff, SubmitOp) and isinstance(eff.request, native.PostmortemDispatchRequest):
+                try:
+                    value = native.PostmortemDriver.execute_request(eff.request)
+                except Exception as exc:
+                    component.handle(IoFailed(op_id=eff.op_id, error=exc), self.state, emitted.append)
+                else:
+                    component.handle(IoCompleted(op_id=eff.op_id, value=value), self.state, emitted.append)
         self.assertEqual(len(emitted), 1)
         self.assertIsInstance(emitted[0], ToolCallFinished)
         self.assertEqual(call.error, error, call.result)

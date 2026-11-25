@@ -105,6 +105,40 @@ class SourceTests(unittest.TestCase):
         self.assertEqual(session["provenance"]["commit_id"], "commit")
 
 
+    def test_identity_reads_features_session_and_durable_envelope(self):
+        plain_doc = {
+            "format_version": 2,
+            "meta": {"session_id": "sess-plain"},
+            "features": {
+                "session": {
+                    "title": "Feature Session Title",
+                    "parent_session_id": "parent-plain",
+                }
+            },
+            "entries": [],
+        }
+        s1, = source.load_sources([self.write("plain.json", plain_doc)], descendants=False)
+        self.assertEqual((s1["id"], s1["parent_id"], s1["title"]),
+                         ("sess-plain", "parent-plain", "Feature Session Title"))
+
+        env_doc = {
+            "format_version": 2,
+            "meta": {"session_id": "sess-env"},
+            "features": {
+                "session": {
+                    "__durable_v__": 1,
+                    "__data__": {
+                        "title": "Durable Envelope Title",
+                        "parent_session_id": "parent-env",
+                    },
+                }
+            },
+            "entries": [],
+        }
+        s2, = source.load_sources([self.write("env.json", env_doc)], descendants=False)
+        self.assertEqual((s2["id"], s2["parent_id"], s2["title"]),
+                         ("sess-env", "parent-env", "Durable Envelope Title"))
+
     def test_portable_state_root_uses_host_precedence_and_absolute_paths(self):
         import os
         import sys

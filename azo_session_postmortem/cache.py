@@ -5,12 +5,31 @@ cursors: private materialization hooks return retained selections or a read plan
 Only presentation is delegated to cache_render; neither module needs the host.
 """
 import json
+import os
 from pathlib import Path
 import re
 import sqlite3
+import tempfile
 
 from . import engine as e
 from . import render as r
+
+try:
+    from agent_zoo.durability import atomic_write_text as _atomic_write_text
+except ImportError:
+    def _atomic_write_text(path, text, *, encoding="utf-8"):
+        target = Path(path)
+        target.parent.mkdir(parents=True, exist_ok=True)
+        fd, tmp_name = tempfile.mkstemp(prefix=f".{target.name}.", dir=target.parent)
+        tmp_path = Path(tmp_name)
+        try:
+            with os.fdopen(fd, "wb") as stream:
+                stream.write(text.encode(encoding))
+                stream.flush()
+                os.fsync(stream.fileno())
+            os.replace(tmp_path, target)
+        finally:
+            tmp_path.unlink(missing_ok=True)
 
 
 SCHEMA = '''
@@ -673,10 +692,7 @@ def dispatch(tool, arguments):
             directory = workspace / 'results'
             directory.mkdir(exist_ok=True)
             output_path = directory / (doc.id + '.txt')
-            temporary = directory / (doc.id + '.tmp')
-            with temporary.open('w', encoding='utf-8', newline='') as stream:
-                stream.write(text)
-            temporary.replace(output_path)
+            _atomic_write_text(output_path, text)
         return {'document': document, 'text': text, 'path': str(output_path), 'preview_chars': preview}
     except (sqlite3.Error, OSError, TypeError, KeyError) as exc:
         if output_path is not None:

@@ -16,7 +16,8 @@ from unittest.mock import patch
 HOST_AVAILABLE = importlib.util.find_spec("agent_utils") is not None
 ZOO_AVAILABLE = importlib.util.find_spec("agent_zoo") is not None
 if HOST_AVAILABLE:
-    from agent_utils.core.events import RenderRequested, RunToolCall, SessionStarted, ToolCallFinished
+    from agent_utils.core.events import IoCompleted, IoFailed, RenderRequested, RunToolCall, SessionRestored, SessionStarted, ToolCallFinished
+    from agent_utils.core.io import SubmitOp
     from agent_utils.core.session import Session
     from agent_utils.core.state import State, ToolCall
     from agent_utils.features.buffers.manager import BufferManager
@@ -52,6 +53,14 @@ class NativeTests(unittest.TestCase):
         emitted = []
         with patch.object(native.cache_render, "render_preview", wraps=native.cache_render.render_preview) as rendered:
             component.handle(RunToolCall(call), self.state, emitted.append)
+            for eff in self.state.io.take_outbox():
+                if isinstance(eff, SubmitOp) and isinstance(eff.request, native.PostmortemDispatchRequest):
+                    try:
+                        value = native.PostmortemDriver.execute_request(eff.request)
+                    except Exception as exc:
+                        component.handle(IoFailed(op_id=eff.op_id, error=exc), self.state, emitted.append)
+                    else:
+                        component.handle(IoCompleted(op_id=eff.op_id, value=value), self.state, emitted.append)
         self.assertEqual(len(emitted), 1)
         self.assertIsInstance(emitted[0], ToolCallFinished)
         self.assertIs(emitted[0].tool_call, call)
@@ -86,16 +95,25 @@ class NativeTests(unittest.TestCase):
         self.assertEqual(features[0].name, "session_postmortem")
         self.assertIsInstance(features[0].components[0], native.SessionPostmortemSkill)
         self.assertEqual(list(native.TOOLS), features[0].components[1:])
+        self.assertEqual(features[0].drivers, [native.PostmortemDriver])
 
-        # Compose onto real host builders and verify schema + skill publication.
+        # Compose onto real host builders and verify schema + skill publication + Sans-I/O cleanliness.
+        from agent_zoo.testing.sans_io_guard import assert_pipeline_sans_io, audit_module_sans_io
+        repo_root = Path(__file__).resolve().parents[1]
+        self.assertEqual(audit_module_sans_io(repo_root / "src" / "session_postmortem.py"), [])
+        self.assertEqual(audit_module_sans_io(repo_root / "azo_session_postmortem" / "native.py"), [])
+
         for make_builder in (build_default_builder, build_default_rlm_builder, build_readonly_rlm_builder):
             session = Session(state=State(cwd=str(self.root)))
             builder = make_builder(session, config={}, include_plugins=False, include_llm_drivers=False)
             native.register_features(builder, session=session, config={})
             pipeline = builder.build()
             pipeline.init_state(session.state)
-            pipeline.step(session.state, SessionStarted())
-            pipeline.step(session.state, RenderRequested())
+            assert_pipeline_sans_io(
+                pipeline,
+                session=session,
+                events=(SessionStarted(), SessionRestored(), RenderRequested()),
+            )
             for component in native.TOOLS:
                 published = session.state.tool_schemas[component.name]
                 self.assertTrue(published["available"])
@@ -226,6 +244,34 @@ class NativeTests(unittest.TestCase):
         component.handle(RenderRequested(), self.state, lambda _ev: None)
         self.assertIsNotNone(replacement.resolve("session-postmortem")[0])
 
+        # Per-session isolation via state.runtime (shared component across two sessions).
+        other_state = State(cwd=str(self.root))
+        other_state.skill_registry = SkillRegistry()
+        component.handle(SessionRestored(), other_state, lambda _ev: None)
+        self.assertIsNotNone(other_state.skill_registry.resolve("session-postmortem")[0])
+
+    def test_postmortem_driver_async_lifecycle(self):
+        driver = native.PostmortemDriver()
+        self.assertEqual(driver.durability, "commit")
+        self.assertEqual(driver.request_types, (native.PostmortemDispatchRequest,))
+        emitted = []
+        driver.start(emitted.append)
+        try:
+            req = native.PostmortemDispatchRequest(
+                tool_name="trace_open",
+                arguments={"workspace": "driver_study", "sessions": ["session.json"], "descendants": False},
+                cwd=str(self.root),
+            )
+            driver.submit("op-1", req)
+            driver.drain(timeout_s=5.0)
+            self.assertEqual(len(emitted), 1)
+            self.assertIsInstance(emitted[0], IoCompleted)
+            self.assertEqual(emitted[0].op_id, "op-1")
+            self.assertEqual(emitted[0].value["document"]["operation"], "trace_open")
+            self.assertEqual(driver.quiesce(policy="terminate"), [])
+        finally:
+            driver.close()
+
     def test_small_previews_keep_full_independent_managed_buffers(self):
         self.open_source()
         refs = self.event_refs()
@@ -337,7 +383,9 @@ class NativeTests(unittest.TestCase):
                 pipeline.step(session.state, RenderRequested())
                 found = {name: session.state.tool_schemas[name] for name in expected}
                 assert all(p["available"] for p in found.values()), (scope, found)
-            assert sys.path == before
+            shim_parent = str(Path(sys.argv[1]).resolve().parent)
+            added_paths = [p for p in sys.path if p not in before]
+            assert all(p == shim_parent for p in added_paths), (before, sys.path)
             assert "azo_session_postmortem" not in sys.modules
             print(json.dumps(sorted(expected)))
         ''')

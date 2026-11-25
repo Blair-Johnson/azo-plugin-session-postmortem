@@ -5,10 +5,29 @@ Cursors and selections are immutable snapshots persisted in trace.sqlite3.
 """
 from bisect import bisect_right
 import json
+import os
 from pathlib import Path
 import random
 import re
 import sqlite3
+import tempfile
+
+try:
+    from agent_zoo.durability import atomic_write_text as _atomic_write_text
+except ImportError:
+    def _atomic_write_text(path, text, *, encoding="utf-8"):
+        target = Path(path)
+        target.parent.mkdir(parents=True, exist_ok=True)
+        fd, tmp_name = tempfile.mkstemp(prefix=f".{target.name}.", dir=target.parent)
+        tmp_path = Path(tmp_name)
+        try:
+            with os.fdopen(fd, "wb") as stream:
+                stream.write(text.encode(encoding))
+                stream.flush()
+                os.fsync(stream.fileno())
+            os.replace(tmp_path, target)
+        finally:
+            tmp_path.unlink(missing_ok=True)
 
 if __package__:
     from .navigation import ensure_session_links, navigation_rows
@@ -32,6 +51,7 @@ CREATE TABLE IF NOT EXISTS saved_queries(name TEXT PRIMARY KEY,tool TEXT,argumen
 CREATE TABLE IF NOT EXISTS _results(id INTEGER PRIMARY KEY,kind TEXT,rows TEXT,meta TEXT);
 CREATE TABLE IF NOT EXISTS _cursors(id INTEGER PRIMARY KEY,kind TEXT,payload TEXT);
 CREATE TABLE IF NOT EXISTS _sources(source TEXT PRIMARY KEY,descendants INTEGER);
+CREATE TABLE IF NOT EXISTS _rlm_jobs(session TEXT NOT NULL,job_id TEXT NOT NULL,child_session_id TEXT NOT NULL,output_map TEXT,PRIMARY KEY(session,job_id));
 '''
 
 
@@ -411,6 +431,19 @@ def trace_open(db, workspace, sessions=None, descendants=True, refresh=False,
                              len(text) if available else 0, int(available), obj.get('session', sid), obj.get('reason')))
                         if available:
                             db.execute('INSERT INTO _content VALUES(?,?,?)', (obj['ref'], 'text', text))
+                    db.execute('CREATE TABLE IF NOT EXISTS _rlm_jobs('
+                               'session TEXT NOT NULL,job_id TEXT NOT NULL,'
+                               'child_session_id TEXT NOT NULL,output_map TEXT,'
+                               'PRIMARY KEY(session,job_id))')
+                    db.execute('DELETE FROM _rlm_jobs WHERE session=?', (sid,))
+                    for job_id, job_info in (session.get('rlm_jobs') or {}).items():
+                        child_id = str((job_info or {}).get('child_session_id') or '').strip()
+                        output_map = (job_info or {}).get('output_map') or {}
+                        if child_id or output_map:
+                            db.execute(
+                                'INSERT OR REPLACE INTO _rlm_jobs VALUES(?,?,?,?)',
+                                (sid, job_id, child_id, _json(output_map)),
+                            )
                     for edge in session.get('links', []):
                         db.execute('INSERT OR IGNORE INTO links VALUES(?,?,?)', (edge['src'], edge['dst'], edge['kind']))
                 db.execute('INSERT OR REPLACE INTO _sources VALUES(?,?)', (locator, int(descend)))
@@ -1218,7 +1251,7 @@ def _read_page(db, workspace, plan, max_chars, output):
             body = block['text'] if 'text' in block else _json(block['card']) if 'card' in block else ''
             sections.append('# ' + _json(label) + '\n' + body)
         packet_text = '\n\n'.join(sections)
-        path.write_text(packet_text, encoding='utf-8')
+        _atomic_write_text(path, packet_text)
         result.pop('blocks')
         result.update(buffer=str(path), buffer_path=str(path),
                       packet_format='text', packet_chars=len(packet_text))

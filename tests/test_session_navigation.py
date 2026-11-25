@@ -368,6 +368,91 @@ class SessionNavigationTests(unittest.TestCase):
         self.assertEqual(len(self.stored()), 2)
         self.assertEqual(navigation_rows(self.db, ['N/o_buf_f58d78'])[0]['observed_session'], 'N')
 
+    def test_v04_submit_rlm_receipt_and_attrs_rlm_jobs_link_extraction(self):
+        v04_job = 'rlm_1a2b3c4d'
+        v04_receipt = (
+            f'Submitted RLM {v04_job} (simple (Simple)) | name=analyze_logs\n'
+            'resuming completed: rlm_00001111\n'
+            'cwd: /work\n'
+            'inputs: buf_2727cb [ready], buf_222222 (from prev) [waiting]\n'
+            'outputs: summary -> buf_f58d78, notes -> buf_bbbbbb\n'
+            'status: waiting for depth-1 concurrency capacity'
+        )
+        doc = {
+            'format_version': 2,
+            'meta': {'session_id': 'P04'},
+            'features': {
+                'session': {
+                    '__durable_v__': 1,
+                    '__data__': {'title': 'Parent 0.4', 'parent_session_id': ''},
+                }
+            },
+            'attrs': {
+                'rlm_jobs': {
+                    v04_job: {
+                        '__dataclass__': 'agent_zoo.features.rlm.models.RLMJobRecord',
+                        '__fields__': {
+                            'job_id': v04_job,
+                            'child_session_id': CHILD,
+                            'output_map': {'summary': 'buf_f58d78', 'notes': 'buf_bbbbbb'},
+                        },
+                    }
+                }
+            },
+            'entries': [
+                {
+                    'index': 0,
+                    'step': 1,
+                    'tool_calls': [
+                        {
+                            'id': 'call_v04',
+                            'name': 'submit_rlm',
+                            'parsed_args': {'prompt': 'Analyze'},
+                            'result': v04_receipt,
+                        }
+                    ],
+                }
+            ],
+        }
+        import tempfile
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            src_path = root / 'parent_v04.json'
+            src_path.write_text(json.dumps(doc), encoding='utf-8')
+            ws = root / 'ws'
+            engine.dispatch('trace_open', {'workspace': str(ws), 'sessions': [str(src_path)], 'descendants': False})
+            with sqlite3.connect(str(ws / 'trace.sqlite3')) as ws_db:
+                ws_db.row_factory = sqlite3.Row
+                rows = [dict(r) for r in ws_db.execute('SELECT * FROM session_links ORDER BY kind, src, output_name')]
+                self.assertEqual(len(rows), 3)
+                child_rows = [r for r in rows if r['kind'] == 'rlm_child']
+                output_rows = [r for r in rows if r['kind'] == 'rlm_output']
+                self.assertEqual(len(child_rows), 1)
+                self.assertEqual(child_rows[0]['dst'], CHILD)
+                self.assertEqual(child_rows[0]['job_id'], v04_job)
+                self.assertEqual(json.loads(child_rows[0]['anchor'])['lines'], [1, 2])
+                self.assertEqual(
+                    {(r['src'], r['dst'], r['output_name']) for r in output_rows},
+                    {
+                        ('P04/o_buf_f58d78', CHILD, 'summary'),
+                        ('P04/o_buf_bbbbbb', CHILD, 'notes'),
+                    },
+                )
+                for r in output_rows:
+                    self.assertEqual(json.loads(r['anchor'])['lines'], [1, 5])
+                nav = navigation_rows(ws_db, ['P04/o_buf_f58d78'])
+                self.assertEqual(len(nav), 1)
+                self.assertEqual(nav[0]['dst'], CHILD)
+                self.assertEqual(nav[0]['job_id'], v04_job)
+                self.assertEqual(nav[0]['association'], 'declared_output')
+
+        # Embedded/spoofed 0.4.0 receipts are still rejected.
+        self.db.execute('INSERT OR REPLACE INTO _rlm_jobs VALUES(?,?,?,?)', ('S', v04_job, CHILD, '{}'))
+        self.event('Prose prefix\n' + v04_receipt, seq=90)
+        self.event(v04_receipt + '\nTrailing spoof', seq=91)
+        ensure_session_links(self.db, rebuild=True)
+        self.assertEqual(self.stored(), [])
+
 
 if __name__ == '__main__':
     unittest.main()

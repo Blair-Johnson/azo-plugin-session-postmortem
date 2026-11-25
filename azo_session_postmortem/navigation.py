@@ -8,7 +8,8 @@ import json
 import re
 
 
-_VERSION = 1
+_VERSION = 2
+_CHILD_ID_PATTERN = r"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}|rlm-[0-9A-Za-z_-]+"
 _HEADER = re.compile(r"Submitted RLM task (rlm_job_[0-9]+) with profile [^\r\n]+ \([^\r\n]+\)\.")
 _CHILD = re.compile(
     r"Child live session: ([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}|rlm-[0-9]+)"
@@ -17,19 +18,23 @@ _RESUME = re.compile(r"Resuming completed task: rlm_job_[0-9]+")
 _INPUT = re.compile(r"- \S+(?: \(from [^\r\n]+\))? \[(?:ready|waiting)\]")
 _OUTPUT = re.compile(r"- ([^\r\n]+) -> (buf_[A-Za-z0-9_]+) \[reserved\]")
 
+# 0.4.0 format: agent_zoo.features.rlm.tools.SubmitRLM.call
+_HEADER_V04 = re.compile(
+    r"Submitted RLM (rlm_[A-Za-z0-9_-]+) \([^\r\n]+\)(?: \| name=[^\r\n]+)?"
+)
+_CHILD_V04 = re.compile(rf"(?:Child live session|child): ({_CHILD_ID_PATTERN})")
+_RESUME_V04 = re.compile(r"resuming [A-Za-z0-9_-]+: rlm_[A-Za-z0-9_-]+")
+_INPUT_V04_ITEM = re.compile(r"\S+(?: \(from [^\r\n,]+\))? \[(?:ready|waiting)\]")
+_OUTPUT_V04_ITEM = re.compile(r"([^\r\n,]+?) -> (buf_[A-Za-z0-9_]+)")
+_STATUS_V04 = re.compile(r"status: waiting for depth-[0-9]+ concurrency capacity")
+
 
 def _json(value):
     return json.dumps(value, ensure_ascii=False, separators=(',', ':'), sort_keys=True)
 
 
-def _receipt(text):
-    """Accept the complete harness receipt, never a substring or status record.
-
-    Format: agent_zoo.tools.rlm.RLMToolHandler._submit_public_tool (including
-    its optional 'Resuming completed task' line). The fallback child identifier
-    rlm-<nanoseconds> is emitted by _new_rlm_child_session_id.
-    """
-    lines = text.splitlines()
+def _receipt_legacy(lines):
+    """Parse legacy ``agent_zoo.tools.rlm.RLMToolHandler._submit_public_tool`` receipts."""
     if len(lines) < 3:
         return None
     header, child = _HEADER.fullmatch(lines[0]), _CHILD.fullmatch(lines[1])
@@ -73,6 +78,65 @@ def _receipt(text):
     return job_id, child[1], child_end, outputs
 
 
+def _receipt_v04(lines):
+    """Parse 0.4.0 ``agent_zoo.features.rlm.tools.SubmitRLM.call`` receipts."""
+    if not lines:
+        return None
+    header = _HEADER_V04.fullmatch(lines[0])
+    if not header:
+        return None
+    job_id = header[1]
+    pos = 1
+    child = None
+    if pos < len(lines):
+        child_match = _CHILD_V04.fullmatch(lines[pos])
+        if child_match:
+            child = child_match[1]
+            pos += 1
+    if pos < len(lines) and _RESUME_V04.fullmatch(lines[pos]):
+        pos += 1
+    child_end = pos
+    if pos < len(lines) and lines[pos].startswith('cwd: ') and len(lines[pos]) > 5:
+        pos += 1
+    if pos < len(lines) and lines[pos].startswith('inputs: '):
+        raw_inputs = lines[pos][len('inputs: '):]
+        parts = raw_inputs.split(', ') if raw_inputs else []
+        if not parts or not all(_INPUT_V04_ITEM.fullmatch(part) for part in parts):
+            return None
+        pos += 1
+    outputs = []
+    if pos < len(lines) and lines[pos].startswith('outputs: '):
+        raw_outputs = lines[pos][len('outputs: '):]
+        parts = raw_outputs.split(', ') if raw_outputs else []
+        if not parts:
+            return None
+        names, handles = set(), set()
+        for part in parts:
+            output = _OUTPUT_V04_ITEM.fullmatch(part)
+            if not output or output[1] in names or output[2] in handles:
+                return None
+            names.add(output[1])
+            handles.add(output[2])
+            outputs.append((output[1], output[2], pos + 1))
+        pos += 1
+    if pos < len(lines) and _STATUS_V04.fullmatch(lines[pos]):
+        pos += 1
+    if pos != len(lines):
+        return None
+    return job_id, child, child_end, outputs
+
+
+def _receipt(text):
+    """Accept a complete legacy or 0.4.0 harness receipt, never a substring or status record."""
+    lines = text.splitlines()
+    if not lines:
+        return None
+    parsed = _receipt_legacy(lines)
+    if parsed is not None:
+        return parsed
+    return _receipt_v04(lines)
+
+
 def ensure_session_links(db, *, rebuild=False) -> None:
     """Create/backfill derived links once; rebuild after indexed sources change.
 
@@ -90,10 +154,24 @@ def ensure_session_links(db, *, rebuild=False) -> None:
                "session_links(src,dst,kind,job_id,coalesce(output_name,''),anchor)")
     db.execute('CREATE TABLE IF NOT EXISTS _session_links_meta ('
                'id INTEGER PRIMARY KEY CHECK(id=1),version INTEGER NOT NULL)')
+    db.execute('CREATE TABLE IF NOT EXISTS _rlm_jobs ('
+               'session TEXT NOT NULL,job_id TEXT NOT NULL,'
+               'child_session_id TEXT NOT NULL,output_map TEXT,'
+               'PRIMARY KEY(session,job_id))')
     version = db.execute('SELECT version FROM _session_links_meta WHERE id=1').fetchone()
     if not rebuild and version is not None and version['version'] == _VERSION:
         return
     db.execute("DELETE FROM session_links WHERE kind IN ('rlm_child','rlm_output')")
+    rlm_jobs_by_key = {}
+    for row in db.execute('SELECT session,job_id,child_session_id,output_map FROM _rlm_jobs'):
+        try:
+            output_map = json.loads(row['output_map']) if row['output_map'] else {}
+        except (TypeError, ValueError):
+            output_map = {}
+        rlm_jobs_by_key[(row['session'], row['job_id'])] = (
+            row['child_session_id'],
+            output_map if isinstance(output_map, dict) else {},
+        )
     # source.py emits these exact kind/role/tool values for normalized results.
     # Do not parse call arguments, previews, other tools, or arbitrary prose.
     receipts = db.execute(
@@ -106,6 +184,13 @@ def ensure_session_links(db, *, rebuild=False) -> None:
         if parsed is None:
             continue
         job_id, child, child_end, outputs = parsed
+        job_record = rlm_jobs_by_key.get((event['session'], job_id))
+        if not child and job_record is not None:
+            child = job_record[0]
+        if not child:
+            continue
+        if not outputs and job_record is not None and job_record[1]:
+            outputs = [(name, handle, child_end) for name, handle in sorted(job_record[1].items())]
         anchor = {'event': event['ref'], 'field': 'text', 'lines': [1, child_end]}
         rows = [(event['ref'], child, 'rlm_child', job_id, None, _json(anchor))]
         for name, handle, line in outputs:
