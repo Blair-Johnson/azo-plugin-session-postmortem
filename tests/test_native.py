@@ -228,10 +228,10 @@ class NativeTests(unittest.TestCase):
         component.handle(RenderRequested(), self.state, lambda _ev: None)
         registry = SkillRegistry()
         self.state.skill_registry = registry
-        with patch.object(registry, "add_sources", wraps=registry.add_sources) as add:
+        with patch.object(registry, "register_skill_text", wraps=registry.register_skill_text) as reg:
             component.handle(RenderRequested(), self.state, lambda _ev: None)
             component.handle(RenderRequested(), self.state, lambda _ev: None)
-            self.assertEqual(add.call_count, 1)
+            self.assertEqual(reg.call_count, 1)
         skill, _ = registry.resolve("session-postmortem")
         self.assertIsNotNone(skill)
         self.assertEqual(skill.source_scope, "bundled")

@@ -12,16 +12,17 @@ from agent_utils.core.events import (
     TurnSettled,
 )
 from agent_utils.core.io import IoRequest
-from agent_utils.core.pipeline import EmitFn, Feature
+from agent_utils.core.pipeline import Feature
 from agent_utils.core.state import State
 from agent_utils.core.tool import Tool
 from agent_utils.features.buffers.tools import resolve_session_path
-from agent_utils.features.skills import SkillSource, parse_skill_text
 
-try:
-    from agent_zoo.durability import QueuedWorkerDriver
-except ImportError:
-    from agent_utils.runtime.driver import QueuedWorkerDriver
+from agent_zoo.durability import (
+    BundledSkillRegistrar,
+    QueuedWorkerDriver,
+    preload_bundled_skill,
+    session_cwd,
+)
 
 from . import cache, cache_render
 
@@ -106,17 +107,6 @@ class PostmortemDriver(QueuedWorkerDriver):
         return self.execute_request(req)
 
 
-def _session_cwd(state: State | None) -> str:
-    if state is None:
-        return ""
-    return str(
-        getattr(state, "cwd", "")
-        or getattr(state, "session_cwd", "")
-        or getattr(state, "terminal_cwd", "")
-        or ""
-    ).strip()
-
-
 def _dispatch_gen(
     name: str,
     workspace: str,
@@ -137,7 +127,7 @@ def _dispatch_gen(
     result = yield PostmortemDispatchRequest(
         tool_name=name,
         arguments=cleaned,
-        cwd=_session_cwd(state),
+        cwd=session_cwd(state),
         home_dir=str(getattr(state, "home_dir", "") or ""),
     )
     buffer_id = ""
@@ -379,60 +369,20 @@ trace_cooccur = TraceCooccur()
 TOOLS = (trace_open, trace_query, trace_search, trace_read, trace_edit, trace_cooccur)
 
 
-@dataclass
-class _PostmortemSkillRuntime:
-    """Ephemeral per-session runtime state tracking skill registration."""
-
-    registry: Any = None
-
-
-class SessionPostmortemSkill:
+class SessionPostmortemSkill(BundledSkillRegistrar):
     """Publish the bundled skill before the harness renders its skill catalog."""
 
-    handles = _SKILL_EVENTS
-    optional_reads = {"skill_registry"}
-    writes = {"skill_registry"}
-
     def __init__(self) -> None:
-        self._cached_source, self._cached_entry = self._preload_bundled_skill()
-
-    @staticmethod
-    def _preload_bundled_skill():
         skill_root = Path(__file__).resolve().parent / "skills" / "session-postmortem"
-        skill_file = skill_root / "SKILL.md"
-        resources = tuple(
-            sorted(
-                p.relative_to(skill_root).as_posix()
-                for p in skill_root.rglob("*")
-                if p.is_file() and p != skill_file
-            )
+        super().__init__(
+            preloaded=preload_bundled_skill(
+                skill_root,
+                kind="azo-plugin-session-postmortem",
+            ),
+            skill_name="session-postmortem",
+            runtime_key="session_postmortem",
+            handles=_SKILL_EVENTS,
         )
-        source = SkillSource(
-            path=str(skill_root),
-            kind="azo-plugin-session-postmortem",
-            scope="bundled",
-            precedence=-5000,
-            native=True,
-            always_list=True,
-        )
-        entry = parse_skill_text(
-            str(skill_file),
-            skill_file.read_text(encoding="utf-8"),
-            source=source,
-            resources=resources,
-        )
-        return source, entry
-
-    def handle(self, event: Event, state: State, emit: EmitFn) -> None:
-        del event, emit
-        registry = getattr(state, "skill_registry", None)
-        if registry is None:
-            return
-        rt = state.runtime("session_postmortem", _PostmortemSkillRuntime)
-        if registry is not rt.registry:
-            registry.add_sources([self._cached_source])
-            registry.register_entry(self._cached_entry)
-            rt.registry = registry
 
 
 def register_features(builder, *, config):
