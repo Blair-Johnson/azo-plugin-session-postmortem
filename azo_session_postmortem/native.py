@@ -396,3 +396,24 @@ def register_features(builder, *, config):
         order=[SessionPostmortemSkill, SystemPromptSkillList],
         drivers=[PostmortemDriver],
     ))
+
+
+def register_sim_handlers(sim, rng):
+    """Register deterministic DST simulation handlers for ``PostmortemDispatchRequest``."""
+    from . import sim as _sim
+
+    _sim.register_sim_handlers(sim, rng)
+
+
+def fuzz_tool_args(tool_name, rng, state):
+    """Generate schema-valid arguments for ``trace_*`` tools during DST fuzzing."""
+    from . import sim as _sim
+
+    return _sim.fuzz_tool_args(tool_name, rng, state)
+
+
+def check_invariants(session):
+    """Verify postmortem scratch-buffer and preview invariants during DST fuzzing."""
+    from . import sim as _sim
+
+    _sim.check_invariants(session)

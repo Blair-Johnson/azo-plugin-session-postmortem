@@ -33,3 +33,18 @@ def _native_module():
 def register_features(builder, *, config):
     """Load the sibling package and register exactly one native feature."""
     _native_module().register_features(builder, config=config)
+
+
+def register_sim_handlers(sim, rng):
+    """Register deterministic DST simulation handlers for postmortem I/O."""
+    _native_module().register_sim_handlers(sim, rng)
+
+
+def fuzz_tool_args(tool_name, rng, state):
+    """Generate deterministic DST fuzz arguments for ``trace_*`` tools."""
+    return _native_module().fuzz_tool_args(tool_name, rng, state)
+
+
+def check_invariants(session):
+    """Verify postmortem invariants during DST fuzzing."""
+    _native_module().check_invariants(session)
