@@ -1,28 +1,27 @@
 """Native Agent Zoo tools; cached evidence remains independent of the host."""
 
 from collections.abc import Iterator
-from concurrent.futures import Future, ThreadPoolExecutor
 from dataclasses import dataclass, field
 from pathlib import Path
-import threading
-import time
 from typing import Any
 
 from agent_utils.core.events import (
     Event,
-    IoCompleted,
-    IoFailed,
     RenderRequested,
     SessionRestored,
     TurnSettled,
 )
-from agent_utils.core.io import IoRequest, OpId
+from agent_utils.core.io import IoRequest
 from agent_utils.core.pipeline import EmitFn, Feature
 from agent_utils.core.state import State
 from agent_utils.core.tool import Tool
 from agent_utils.features.buffers.tools import resolve_session_path
 from agent_utils.features.skills import SkillSource, parse_skill_text
-from agent_utils.runtime.driver import Driver
+
+try:
+    from agent_zoo.durability import QueuedWorkerDriver
+except ImportError:
+    from agent_utils.runtime.driver import QueuedWorkerDriver
 
 from . import cache, cache_render
 
@@ -60,28 +59,12 @@ class _PathContext:
         self.home_dir = home_dir
 
 
-class PostmortemDriver(Driver):
+class PostmortemDriver(QueuedWorkerDriver):
     """Commit-class driver executing ``PostmortemDispatchRequest`` on a dedicated worker."""
 
     request_types = (PostmortemDispatchRequest,)
     durability = "commit"
-
-    def __init__(self) -> None:
-        super().__init__()
-        self._cond = threading.Condition(threading.RLock())
-        self._executor: ThreadPoolExecutor | None = None
-        self._futures: dict[OpId, Future[Any]] = {}
-        self._cancelled: set[OpId] = set()
-        self._closing = False
-        self._closed = False
-
-    def _ensure_executor_locked(self) -> ThreadPoolExecutor:
-        if self._executor is None:
-            self._executor = ThreadPoolExecutor(
-                max_workers=1,
-                thread_name_prefix="azo-postmortem",
-            )
-        return self._executor
+    worker_name = "azo-postmortem"
 
     @staticmethod
     def _prepare_arguments(req: PostmortemDispatchRequest) -> dict[str, Any]:
@@ -115,103 +98,12 @@ class PostmortemDriver(Driver):
         arguments = cls._prepare_arguments(req)
         return cache.dispatch(req.tool_name, arguments)
 
-    def start(self, emit: EmitFn) -> None:
-        super().start(emit)
-        with self._cond:
-            self._closing = False
-            self._closed = False
-            self._ensure_executor_locked()
-
-    def submit(self, op_id: OpId, req: IoRequest) -> None:
+    def execute(self, req: IoRequest) -> dict[str, Any]:
         if not isinstance(req, PostmortemDispatchRequest):
             raise TypeError(
                 f"PostmortemDriver expected PostmortemDispatchRequest, got {type(req).__name__}"
             )
-        with self._cond:
-            if self._closing or self._closed or op_id in self._cancelled:
-                return
-            executor = self._ensure_executor_locked()
-            fut = executor.submit(self._run_op, op_id, req)
-            self._futures[op_id] = fut
-
-    def cancel(self, op_id: OpId) -> None:
-        with self._cond:
-            self._cancelled.add(op_id)
-            fut = self._futures.get(op_id)
-            if fut is not None and fut.cancel():
-                self._futures.pop(op_id, None)
-                self._cancelled.discard(op_id)
-                self._cond.notify_all()
-
-    def drain(self, *, timeout_s: float | None = None) -> None:
-        deadline = (
-            None
-            if timeout_s is None
-            else (time.monotonic() + max(0.0, float(timeout_s)))
-        )
-        with self._cond:
-            while self._futures and not self._closed:
-                if deadline is not None:
-                    remaining = deadline - time.monotonic()
-                    if remaining <= 0:
-                        return
-                    self._cond.wait(timeout=min(remaining, 0.25))
-                else:
-                    self._cond.wait(timeout=0.25)
-
-    def quiesce(
-        self,
-        *,
-        policy: str = "terminate",
-        deadline: float | None = None,
-    ) -> list[Event]:
-        del policy
-        remaining = (
-            None
-            if deadline is None
-            else max(0.0, float(deadline) - time.monotonic())
-        )
-        self.drain(timeout_s=remaining)
-        return []
-
-    def close(self) -> None:
-        with self._cond:
-            self._closing = True
-            executor = self._executor
-            self._cond.notify_all()
-        self.drain(timeout_s=5.0)
-        if executor is not None:
-            executor.shutdown(wait=True, cancel_futures=False)
-        with self._cond:
-            self._closed = True
-            self._executor = None
-            self._futures.clear()
-            self._cancelled.clear()
-            self._cond.notify_all()
-
-    def _is_fenced(self, op_id: OpId) -> bool:
-        with self._cond:
-            return self._closed or op_id in self._cancelled
-
-    def _run_op(self, op_id: OpId, req: PostmortemDispatchRequest) -> None:
-        if self._is_fenced(op_id):
-            with self._cond:
-                self._futures.pop(op_id, None)
-                self._cancelled.discard(op_id)
-                self._cond.notify_all()
-            return
-        try:
-            result = self.execute_request(req)
-            if not self._is_fenced(op_id):
-                self._safe_emit(IoCompleted(op_id=op_id, value=result))
-        except Exception as exc:
-            if not self._is_fenced(op_id):
-                self._safe_emit(IoFailed(op_id=op_id, error=exc))
-        finally:
-            with self._cond:
-                self._futures.pop(op_id, None)
-                self._cancelled.discard(op_id)
-                self._cond.notify_all()
+        return self.execute_request(req)
 
 
 def _session_cwd(state: State | None) -> str:
