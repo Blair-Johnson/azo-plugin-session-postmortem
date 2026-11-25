@@ -30,6 +30,6 @@ def _native_module():
     return importlib.import_module(package_name + ".native")
 
 
-def register_features(builder, *, session, config):
+def register_features(builder, *, config):
     """Load the sibling package and register exactly one native feature."""
-    _native_module().register_features(builder, session=session, config=config)
+    _native_module().register_features(builder, config=config)

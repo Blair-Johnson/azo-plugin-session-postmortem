@@ -90,7 +90,7 @@ class NativeTests(unittest.TestCase):
         class Builder:
             def add(self, feature):
                 features.append(feature)
-        native.register_features(Builder(), session=None, config={})
+        native.register_features(Builder(), config={})
         self.assertEqual(len(features), 1)
         self.assertEqual(features[0].name, "session_postmortem")
         self.assertIsInstance(features[0].components[0], native.SessionPostmortemSkill)
@@ -106,7 +106,7 @@ class NativeTests(unittest.TestCase):
         for make_builder in (build_default_builder, build_default_rlm_builder, build_readonly_rlm_builder):
             session = Session(state=State(cwd=str(self.root)))
             builder = make_builder(session, config={}, include_plugins=False, include_llm_drivers=False)
-            native.register_features(builder, session=session, config={})
+            native.register_features(builder, config={})
             pipeline = builder.build()
             pipeline.init_state(session.state)
             assert_pipeline_sans_io(

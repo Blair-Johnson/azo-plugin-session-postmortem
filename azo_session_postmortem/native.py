@@ -435,9 +435,9 @@ class SessionPostmortemSkill:
             rt.registry = registry
 
 
-def register_features(builder, *, session, config):
+def register_features(builder, *, config):
     """Register six tools, their bundled skill, and commit-class PostmortemDriver."""
-    del session, config
+    del config
     from agent_zoo.features.system_prompt import SystemPromptSkillList
 
     builder.add(Feature(
